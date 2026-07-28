@@ -1,0 +1,3 @@
+pandoc
+poppler-utils
+libreoffice-writer
