@@ -3,11 +3,21 @@
 A tiny web app that turns your **Overleaf** sources (LaTeX + `references.bib` +
 figures) into an **editable Word `.docx`** — Times New Roman, justified, title
 page, running header, real Word equations, and clickable ACS citations built
-from your `.bib`. Optional **Zotero** mode emits live-citation markers.
+from your `.bib`.
+
+Upload the Overleaf source `.zip` (optionally also the compiled PDF), click
+convert, and download a **bundle `.zip`** containing the Word file, the compiled
+PDF (if you provided one), the `.bib`, and all figures.
 
 It runs the proven `tex2docx.py` engine behind a Streamlit upload → convert →
 download page. **No GPU and no LaTeX install** — it uses pandoc, not a LaTeX
 compile.
+
+Figures and tables are handled properly: images are **centred** at exactly the
+fraction of the text width you set in LaTeX (`width=0.5\textwidth`), captions are
+numbered **"Figure N:"** (below) and **"Table N:"** (on top), and `\cref`/`\ref`
+cross-references become **clickable internal links** to the section, figure, or
+table.
 
 ---
 

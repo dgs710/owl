@@ -55,7 +55,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<p class="owl-title">🦉 OWL</p>', unsafe_allow_html=True)
-st.markdown('<p class="owl-sub">Overleaf · Word · LaTeX — one upload, a Word document back</p>',
+st.markdown('<p class="owl-sub">Overleaf · Word · LaTeX — one upload, a Word bundle back</p>',
             unsafe_allow_html=True)
 st.write("")
 
@@ -124,21 +124,21 @@ with st.expander("…or upload individual files instead"):
     up_figs = st.file_uploader("figures (png / jpg / pdf / eps)",
                                accept_multiple_files=True)
 
-st.markdown("### 2 · Choose the output")
-mode = st.radio(
-    "Mode",
-    ["Editable Word", "Editable + live Zotero citations"],
-    captions=[
-        "Times New Roman, justified, title page, running header, real Word "
-        "equations, and clickable ACS citations built from your .bib. Best when "
-        "the reader needs to edit or comment.",
-        "Same document, but citations are emitted as Zotero RTF/ODF-Scan markers "
-        "so one scan turns them into live, editable Zotero fields (steps shown "
-        "after conversion).",
-    ],
-    label_visibility="collapsed",
-)
-zotero = mode.startswith("Editable +")
+st.markdown(
+    '<p class="owl-note">Optional: also drop in your <b>compiled PDF</b> '
+    '(Overleaf → Download → PDF) and it gets added to the download bundle. '
+    'The Overleaf <em>source</em> zip doesn\'t contain the PDF, so upload it '
+    'here if you want it included.</p>', unsafe_allow_html=True)
+up_pdf = st.file_uploader("Compiled PDF (optional)", type=["pdf"])
+
+st.markdown("### 2 · Convert")
+st.markdown(
+    '<p class="owl-note">Produces an <b>editable Word</b> document — Times New '
+    'Roman, justified, title page, running header, real Word equations, and '
+    'clickable ACS citations built from your <code>.bib</code>. You get back a '
+    '<b>zip</b> with the Word file, your compiled PDF (if provided), the '
+    '<code>.bib</code>, and all figures.</p>', unsafe_allow_html=True)
+zotero = False
 
 go = st.button("Convert to Word →", type="primary")
 
@@ -164,39 +164,78 @@ if go:
             st.error("No .tex file found in the upload.")
             st.stop()
 
+        # optional compiled PDF -> save next to the sources for bundling
+        if up_pdf is not None:
+            pdf_name = os.path.splitext(os.path.basename(main_tex))[0] + ".pdf"
+            open(os.path.join(os.path.dirname(main_tex), pdf_name), "wb").write(up_pdf.getbuffer())
+
         with st.spinner("Converting with pandoc…"):
             proc = run_convert(os.path.dirname(main_tex), main_tex, zotero)
 
         # locate the produced .docx
         base = os.path.splitext(main_tex)[0]
-        out = base + ("_zotero.docx" if zotero else ".docx")
+        out = base + ".docx"
         if proc.returncode != 0 or not os.path.exists(out):
             st.error("Conversion failed. Details below.")
             st.code((proc.stderr or proc.stdout or "no output")[-3000:])
             st.stop()
 
-        data = open(out, "rb").read()
-        st.success(f"Done — {os.path.basename(out)} ({len(data)//1024} KB)")
-        st.download_button("⬇ Download Word document", data,
+        # ── assemble the download bundle: Word + PDF + .bib + figures ──
+        srcdir = os.path.dirname(main_tex)
+        paper = os.path.splitext(os.path.basename(main_tex))[0]
+        IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".eps", ".pdf",
+                   ".svg", ".tif", ".tiff")
+        bundle = io.BytesIO()
+        included = []
+        with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as z:
+            # the converted Word file
+            z.write(out, os.path.basename(out))
+            included.append(os.path.basename(out))
+            # the compiled PDF, if the user supplied one
+            pdf_path = os.path.join(srcdir, paper + ".pdf")
+            if up_pdf is not None and os.path.exists(pdf_path):
+                z.write(pdf_path, paper + ".pdf")
+                included.append(paper + ".pdf")
+            # the bibliography
+            for f in os.listdir(srcdir):
+                if f.lower().endswith(".bib"):
+                    z.write(os.path.join(srcdir, f), f)
+                    included.append(f)
+            # every figure / image, under figures/
+            for dp, _, files in os.walk(srcdir):
+                for f in files:
+                    low = f.lower()
+                    if not low.endswith(IMG_EXT):
+                        continue
+                    if low.endswith("_conv.png"):        # skip our auto-conversions
+                        continue
+                    full = os.path.join(dp, f)
+                    if os.path.abspath(full) == os.path.abspath(pdf_path):
+                        continue                          # already added as the paper PDF
+                    rel = os.path.relpath(full, srcdir)
+                    z.write(full, os.path.join("figures", os.path.basename(rel)))
+                    included.append("figures/" + os.path.basename(rel))
+        bundle.seek(0)
+
+        n_fig = sum(1 for x in included if x.startswith("figures/"))
+        st.success(f"Done — bundled {len(included)} files "
+                   f"({n_fig} figure{'s' if n_fig != 1 else ''}).")
+        st.download_button("⬇ Download bundle (.zip)", bundle.getvalue(),
+                           file_name=f"{paper}_bundle.zip", mime="application/zip",
+                           type="primary")
+        with st.expander("what's in the zip"):
+            st.write("\n".join("• " + x for x in included))
+            if up_pdf is None:
+                st.info("No compiled PDF included — upload one above if you want it "
+                        "in the bundle.")
+        # also offer the Word file on its own
+        st.download_button("…or just the Word file", open(out, "rb").read(),
                            file_name=os.path.basename(out),
                            mime="application/vnd.openxmlformats-officedocument."
                                 "wordprocessingml.document")
         if proc.stdout.strip():
             with st.expander("conversion log"):
                 st.code(proc.stdout)
-
-        if zotero:
-            st.markdown("---")
-            st.markdown("#### Make the citations live (one-time Zotero scan)")
-            st.markdown("""
-1. **Import your `.bib` into Zotero** (File → Import) — the same file Overleaf syncs.
-2. Open the downloaded `.docx` in **LibreOffice** and **Save As `.odt`**.
-3. **Zotero → Tools → RTF/ODF Scan → “ODF (to ODF)”**, pick the `.odt`.
-4. **Confirm each source** once in the dialog (resolves any ambiguous author+year).
-5. Open the scanned `.odt`: every citation is now a **live Zotero field** and the
-   bibliography is generated at the `{Bibliography}` marker. Move it back to Word
-   when you're done — Zotero carries the fields over.
-""")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

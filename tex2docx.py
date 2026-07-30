@@ -34,6 +34,12 @@ PAGEBREAK_MARK = "TEX2DOCXPAGEBREAKMARK"
 APPENDIX_MARK = "TEX2DOCXAPPENDIXMARK"
 REFERENCES_MARK = "TEX2DOCXREFERENCESMARK"
 
+# private-use delimiters for clickable cross-reference tokens (pass through pandoc
+# untouched, never occur in real text): <A> anchor <S> display <E>
+XREF_A = "\ue000"
+XREF_S = "\ue001"
+XREF_E = "\ue002"
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REFERENCE_DOCX = os.path.join(HERE, "reference.docx")
 CSL_PATH = os.path.join(HERE, "american-chemical-society.csl")
@@ -108,6 +114,58 @@ def build_label_map(src):
             labels[m.group(3)] = (kind, num)
             pending = None
     return labels
+
+
+def parse_width(opts):
+    """From an \\includegraphics option string, return the fraction of the text
+    width requested (width=0.5\\textwidth -> 0.5, width=\\linewidth -> 1.0), or
+    None if the width isn't given relative to the text/line/column width."""
+    m = re.search(r"width\s*=\s*([0-9]*\.?[0-9]+)?\s*\\(?:text|line|column)width",
+                  opts or "")
+    if m:
+        return float(m.group(1)) if m.group(1) else 1.0
+    return None
+
+
+def scan_floats(src):
+    """Walk the document once and return, in document order:
+       * img_widths  : one width-fraction (or None) per \\includegraphics
+       * fig_labels  : one \\label (or None) per figure environment
+       * tab_labels  : one \\label (or None) per table environment
+    Used to resize/centre images and to number + bookmark captions."""
+    img_widths, fig_labels, tab_labels = [], [], []
+    stack = []
+    tok = re.compile(
+        r"\\begin\{(figure|table)\}\*?|"
+        r"\\end\{(figure|table)\}\*?|"
+        r"\\includegraphics\s*(\[[^\]]*\])?\s*\{[^}]*\}|"
+        r"\\label\{([^}]+)\}")
+    for m in tok.finditer(src):
+        if m.group(1):                       # \begin{figure|table}
+            stack.append(m.group(1))
+            (fig_labels if m.group(1) == "figure" else tab_labels).append(None)
+        elif m.group(2):                     # \end{figure|table}
+            if stack:
+                stack.pop()
+        elif m.group(0).startswith("\\includegraphics"):
+            img_widths.append(parse_width(m.group(3)))
+        elif m.group(4):                     # \label{...}
+            if stack and stack[-1] == "figure" and fig_labels and fig_labels[-1] is None:
+                fig_labels[-1] = m.group(4)
+            elif stack and stack[-1] == "table" and tab_labels and tab_labels[-1] is None:
+                tab_labels[-1] = m.group(4)
+    return img_widths, fig_labels, tab_labels
+
+
+def collect_referenced(src):
+    """Every label targeted by a \\cref/\\Cref/\\autoref/\\ref, so we know which
+    bookmarks to keep as link targets."""
+    out = set()
+    for m in re.finditer(r"\\(?:Cref|cref|autoref|ref)\{([^}]*)\}", src):
+        for p in m.group(1).split(","):
+            if p.strip():
+                out.add(p.strip())
+    return out
 
 
 def parse_ch(body):
@@ -266,15 +324,21 @@ def preprocess(src, tex_dir, labels, keep_drafts):
         src = replace_braced(src, "draftnote", lambda s: "")
     src = src.replace(r"\outlinetag", "")
 
-    # 3) cross-references: \cref / \Cref / \autoref / \ref  ->  "Section 2" etc.
+    # 3) cross-references: \cref / \Cref / \autoref / \ref  ->  clickable
+    #    "Section 2" / "Figure 1" links (token now, real hyperlink in postprocess)
     def xref(inner):
-        parts = [p.strip() for p in inner.split(",")]
+        parts = [p.strip() for p in inner.split(",") if p.strip()]
         names = []
         for p in parts:
-            kind, num = labels.get(p, ("Section", None))
-            names.append(f"{kind} {num}" if num else kind)
-        if len(names) == 1:
-            return names[0]
+            kind, num = labels.get(p, (None, None))
+            if kind and num:
+                names.append(XREF_A + p + XREF_S + f"{kind} {num}" + XREF_E)
+            elif kind:
+                names.append(kind)
+            else:
+                names.append(p)
+        if len(names) <= 1:
+            return names[0] if names else ""
         return ", ".join(names[:-1]) + " and " + names[-1]
     for mac in ("Cref", "cref", "autoref", "ref"):
         src = replace_braced(src, mac, xref)
@@ -316,9 +380,12 @@ def preprocess(src, tex_dir, labels, keep_drafts):
 # assets: ACS csl (download once) + reference.docx (built by make_reference.py)
 # ----------------------------------------------------------------------------
 
-def postprocess_docx(path, header_title):
+def postprocess_docx(path, header_title, floats=((), (), ()), referenced=frozenset()):
     """After pandoc, rebuild the page furniture so it matches the LaTeX:
       * centre + enlarge the cover block (title page);
+      * resize images to the requested fraction of the text width and centre them;
+      * number captions ("Figure N:" / "Table N:") and bookmark them;
+      * turn \\cref/\\ref cross-references into clickable internal hyperlinks;
       * turn \\newpage sentinels into real Word page breaks;
       * split the back matter into its own section(s) with a running header
         and Roman page numbers, the body with Arabic numbers starting at 1,
@@ -386,6 +453,145 @@ def postprocess_docx(path, header_title):
             bottom.set(qn(k), v)
         pbdr.append(bottom); pPr.append(pbdr)
 
+    # ── figures / tables / cross-references ──────────────────────────────
+    img_widths, fig_labels, tab_labels = floats
+    _bid = [9000]
+
+    # 1) figures: pandoc wraps each figure in a 2-column "FigureTable" (which
+    #    jams the image into one cell -> off-centre and size-constrained). We
+    #    UNWRAP every figure image into a clean centred body paragraph sized to
+    #    the requested fraction of the text width. Inline images that aren't in a
+    #    figure table (e.g. the title crest) are just resized in place + centred.
+    import io as _io
+
+    def _ancestor(el, tag):
+        while el is not None and el.tag != qn(tag):
+            el = el.getparent()
+        return el
+
+    def _center(pel):
+        pPr = pel.find(qn("w:pPr"))
+        if pPr is None:
+            pPr = OxmlElement("w:pPr"); pel.insert(0, pPr)
+        for j in pPr.findall(qn("w:jc")):
+            pPr.remove(j)
+        jc = OxmlElement("w:jc"); jc.set(qn("w:val"), "center"); pPr.append(jc)
+
+    sec0 = d.sections[0]
+    text_w = ((sec0.page_width or Emu(7772400))
+              - (sec0.left_margin or Emu(914400))
+              - (sec0.right_margin or Emu(914400)))
+    img_i = 0
+    for draw in list(d.element.iter(qn("w:drawing"))):
+        frac = img_widths[img_i] if img_i < len(img_widths) else None
+        img_i += 1
+        ext = draw.find(".//" + qn("wp:extent"))
+        ncx = int(ext.get("cx")) if ext is not None else 0
+        target = int(text_w * frac) if frac else (ncx or None)
+        tbl = _ancestor(draw, "w:tbl")
+        if tbl is not None:                           # figure wrapped in a table
+            blip = draw.find(".//" + qn("a:blip"))
+            rid = blip.get(qn("r:embed")) if blip is not None else None
+            try:
+                blob = d.part.related_parts[rid].blob if rid else None
+            except Exception:
+                blob = None
+            if not blob or not target:
+                continue
+            try:
+                d.add_picture(_io.BytesIO(blob), width=Emu(target))
+            except Exception:
+                continue
+            new_p = d.paragraphs[-1]._p                # the paragraph add_picture made
+            _center(new_p)
+            tbl.addprevious(new_p)                     # move it in front of the table
+            tbl.getparent().remove(tbl)                # drop the wrapper table
+        else:                                          # inline image (not a figure)
+            pel = _ancestor(draw, "w:p")
+            if pel is not None:
+                _center(pel)
+            if frac and ext is not None and ncx:
+                cy = int(ext.get("cy"))
+                for e in (ext, draw.find(".//" + qn("a:ext"))):
+                    if e is not None:
+                        e.set("cx", str(target)); e.set("cy", str(int(cy * target / ncx)))
+
+    # 2) number captions and bookmark them for cross-references
+    def _norm(s):
+        return (s or "").replace(" ", "").lower()
+
+    def _prepend_bold(p, text):
+        r = OxmlElement("w:r")
+        rpr = OxmlElement("w:rPr"); rpr.append(OxmlElement("w:b")); r.append(rpr)
+        t = OxmlElement("w:t"); t.set(qn("xml:space"), "preserve"); t.text = text
+        r.append(t)
+        pPr = p._p.find(qn("w:pPr"))
+        (pPr.addnext(r) if pPr is not None else p._p.insert(0, r))
+
+    def _bookmark(p, name):
+        _bid[0] += 1
+        s = OxmlElement("w:bookmarkStart")
+        s.set(qn("w:id"), str(_bid[0])); s.set(qn("w:name"), name)
+        e = OxmlElement("w:bookmarkEnd"); e.set(qn("w:id"), str(_bid[0]))
+        pPr = p._p.find(qn("w:pPr"))
+        (pPr.addnext(s) if pPr is not None else p._p.insert(0, s))
+        p._p.append(e)
+
+    fig_i = tab_i = 0
+    for p in d.paragraphs:
+        st = _norm(p.style.name if p.style else "")
+        if st == "imagecaption":
+            _prepend_bold(p, f"Figure {fig_i + 1}: ")
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            lbl = fig_labels[fig_i] if fig_i < len(fig_labels) else None
+            if lbl:
+                _bookmark(p, lbl)
+            fig_i += 1
+        elif st == "tablecaption":
+            _prepend_bold(p, f"Table {tab_i + 1}: ")
+            lbl = tab_labels[tab_i] if tab_i < len(tab_labels) else None
+            if lbl:
+                _bookmark(p, lbl)
+            tab_i += 1
+
+    # 3) cross-reference tokens -> real clickable internal hyperlinks
+    tokre = re.compile(re.escape(XREF_A) + r"(.*?)" + re.escape(XREF_S)
+                       + r"(.*?)" + re.escape(XREF_E))
+
+    def _run(text, rpr):
+        r = OxmlElement("w:r")
+        if rpr is not None:
+            r.append(copy.deepcopy(rpr))
+        t = OxmlElement("w:t"); t.set(qn("xml:space"), "preserve"); t.text = text
+        r.append(t)
+        return r
+
+    def _link(anchor, disp, rpr):
+        hl = OxmlElement("w:hyperlink"); hl.set(qn("w:anchor"), anchor)
+        hl.append(_run(disp, rpr))
+        return hl
+
+    for r in list(d.element.iter(qn("w:r"))):
+        ts = r.findall(qn("w:t"))
+        if not ts:
+            continue
+        txt = "".join(t.text or "" for t in ts)
+        if XREF_A not in txt:
+            continue
+        rpr = r.find(qn("w:rPr"))
+        parent = r.getparent(); idx = list(parent).index(r)
+        nodes, pos = [], 0
+        for m in tokre.finditer(txt):
+            if m.start() > pos:
+                nodes.append(_run(txt[pos:m.start()], rpr))
+            nodes.append(_link(m.group(1), m.group(2), rpr))
+            pos = m.end()
+        if pos < len(txt):
+            nodes.append(_run(txt[pos:], rpr))
+        parent.remove(r)
+        for k, node in enumerate(nodes):
+            parent.insert(idx + k, node)
+
     paras = d.paragraphs
     base_sectPr = d.sections[-1]._sectPr
 
@@ -428,12 +634,14 @@ def postprocess_docx(path, header_title):
     # --- configure each section: header + numbering ---
     secs = d.sections
     # remove the heading bookmarks (the grey [ ] markers). Pandoc bookmarks every
-    # heading; only the "ref-..." bookmarks (citation targets) need to stay.
+    # heading; keep the "ref-..." citation targets AND any label a cross-reference
+    # actually points at (so the clickable links resolve).
     remove_ids = set()
     for bm in d.element.iter(qn("w:bookmarkStart")):
         name = bm.get(qn("w:name")) or ""
-        if not name.startswith("ref-"):
-            remove_ids.add(bm.get(qn("w:id")))
+        if name.startswith("ref-") or name in referenced:
+            continue
+        remove_ids.add(bm.get(qn("w:id")))
     for tag in ("w:bookmarkStart", "w:bookmarkEnd"):
         for bm in list(d.element.iter(qn(tag))):
             if bm.get(qn("w:id")) in remove_ids:
@@ -625,6 +833,8 @@ def main():
                     .replace("\\&", "&").strip())
 
     labels = build_label_map(src)
+    floats = scan_floats(src)              # image widths + figure/table labels
+    referenced = collect_referenced(src)   # labels targeted by cross-references
     src = preprocess(src, tex_dir, labels, args.keep_drafts)
 
     if args.zotero:
@@ -661,7 +871,7 @@ def main():
         for line in proc.stderr.strip().splitlines():
             log(f"pandoc: {line}")
     os.remove(pre_path)
-    postprocess_docx(out_path, header_title)
+    postprocess_docx(out_path, header_title, floats, referenced)
     print(f"OK  ->  {out_path}")
     if args.zotero:
         print("  -> citations are Zotero scan markers {Author, Year}. To make "
