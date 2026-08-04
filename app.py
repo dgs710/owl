@@ -74,6 +74,8 @@ if not st.session_state.owl_ok:
             st.rerun()
         else:
             st.error("Incorrect password.")
+    st.caption("© 2026 David G. Schauer · All rights reserved. "
+               "OWL is an original tool by the author.")
     st.stop()
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -251,3 +253,9 @@ a setting. If a reader needs it to *look* pixel-for-pixel identical, just hand
 them the compiled Overleaf **PDF** — this tool is for the **editable** hand-off.
 """)
 st.caption("OWL · built on pandoc + python-docx · no LaTeX install required.")
+st.caption("© 2026 David G. Schauer · All rights reserved. OWL — the app, workflow "
+           "and code — is an original work of the author. It gratefully builds on the "
+           "open-source [pandoc](https://pandoc.org) and "
+           "[python-docx](https://python-docx.readthedocs.io) projects — "
+           "thanks to their developers. No reuse or redistribution without "
+           "written permission.")

@@ -1,0 +1,35 @@
+OWL — Overleaf · Word · LaTeX converter
+Copyright (c) 2026 David G. Schauer. All rights reserved.
+
+OWL is an original work of the author. This software and its source
+code are made publicly viewable for portfolio and demonstration
+purposes only.
+
+Permission is NOT granted to use, copy, modify, merge, publish,
+distribute, sublicense, sell, or create derivative works from this
+software, in whole or in part, without the prior written permission
+of the copyright holder.
+
+Viewing and reading the source code on GitHub is permitted. Any
+other use requires a written license from the author.
+
+THIRD-PARTY TOOLS — ACKNOWLEDGMENT
+----------------------------------
+OWL orchestrates, but does not include or modify, the following
+open-source tools, and the author is grateful to their developers:
+
+  - pandoc (https://pandoc.org) — invoked as an external program
+    for the LaTeX → Word conversion (GPL-2.0+; not bundled in this
+    repository)
+  - python-docx and other Python dependencies listed in
+    requirements.txt — installed from PyPI under their own licenses
+
+The conversion workflow, application design, and all code in this
+repository are original work of the author.
+
+For licensing inquiries, contact: david@dgschauer.com
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE USE OF THE
+SOFTWARE.
