@@ -1,23 +1,35 @@
 # 🦉 OWL — Overleaf · Word · LaTeX
 
-A tiny web app that turns your **Overleaf** sources (LaTeX + `references.bib` +
-figures) into an **editable Word `.docx`** — Times New Roman, justified, title
-page, running header, real Word equations, and clickable ACS citations built
-from your `.bib`.
+Turns your **Overleaf** sources (LaTeX + `references.bib` + figures) into an
+**editable Word `.docx`** — Times New Roman, justified, title page, running
+header, real Word equations, numbered figure and table captions, clickable
+cross-references, and a static ACS reference list with live DOI links.
 
-Upload the Overleaf source `.zip` (optionally also the compiled PDF), click
-convert, and download a **bundle `.zip`** containing the Word file, the compiled
-PDF (if you provided one), the `.bib`, and all figures.
+No LaTeX install and no GPU: it uses pandoc, not a LaTeX compile.
 
-It runs the proven `tex2docx.py` engine behind a Streamlit upload → convert →
-download page. **No GPU and no LaTeX install** — it uses pandoc, not a LaTeX
-compile.
+---
 
-Figures and tables are handled properly: images are **centred** at exactly the
-fraction of the text width you set in LaTeX (`width=0.5\textwidth`), captions are
-numbered **"Figure N:"** (below) and **"Table N:"** (on top), and `\cref`/`\ref`
-cross-references become **clickable internal links** to the section, figure, or
-table.
+## Layout
+
+```
+app.py                  Streamlit UI — upload, convert, download. No logic.
+tex2docx.py             CLI front end (same pipeline as the app)
+owlkit/
+  convert.py            the one entry point: preflight → pandoc → postprocess
+  preflight.py          validates the .tex and reports source line numbers
+  counters.py           LaTeX counter machine: what number each \label prints
+  engine.py             preprocess, figure resolution, docx postprocessing
+  floats.py             where the compiled PDF actually placed each float
+  pagefit.py            page-boundary matching (experimental — see below)
+  constants.py          shared markers and asset paths
+assets/
+  reference.docx        the Word style template
+  american-chemical-society.csl
+tests/test_owl.py       regression tests for every bug listed below
+```
+
+Everything goes through `owlkit.convert()`, so the app and the CLI cannot
+drift apart.
 
 ---
 
@@ -25,69 +37,143 @@ table.
 
 ```bash
 pip install -r requirements.txt
-# system tools (once): pandoc + poppler (+ libreoffice optional)
+# system tools, once:
 #   macOS:   brew install pandoc poppler
-#   Ubuntu:  sudo apt-get install -y pandoc poppler-utils libreoffice-writer
-streamlit run app.py
+#   Ubuntu:  sudo apt-get install -y pandoc poppler-utils
+streamlit run app.py          # or: python tex2docx.py main.tex
+python tests/test_owl.py      # regression tests
 ```
 
-Open the URL it prints, enter the password (default `xX2357Xx`), upload your
-Overleaf **source `.zip`**, pick a mode, download the `.docx`.
+Set `OWL_PASSWORD` in Streamlit **Secrets**. There is deliberately no default
+password in the code — if the secret is missing the app refuses to unlock
+rather than falling back to a value that is public in this repository.
 
 ---
 
-## Deploy free on Streamlit Community Cloud  (recommended)
+## Preflight
 
-1. Put this whole folder in a **GitHub repo** (e.g. `owl`). Push it (GitHub
-   Desktop is fine — same as your website).
-2. Go to **share.streamlit.io** → sign in with GitHub → **Create app** →
-   pick your repo, branch `main`, main file `app.py`.
-3. Under **Advanced → Secrets**, add your password so it isn't in the code:
+OWL checks the source *before* pandoc sees it, and reports a **line number**
+and a fix for each problem. This exists because a single stray `{` used to
+surface as
+
+```
+Error at "....pre.tex" (line 686, column 1): unexpected \end
+```
+
+— pointing at `\end{document}`, hundreds of lines from the actual typo.
+
+It checks for: unbalanced braces (per paragraph), unbalanced environments,
+citations with no `.bib`, figures that do not resolve, `\textcolor` inside
+`$…$`, duplicate labels, and cross-references to labels that do not exist.
+
+**A missing `.bib` is an error, not a warning.** Pandoc without a bibliography
+converts *successfully* and silently discards every citation and the whole
+reference list — a worse outcome than a clear refusal. Untick "Stop if the
+LaTeX has problems" to convert anyway.
+
+---
+
+## Fixed in the rebuild
+
+- **`\includegraphics[width=…]{…}` was never processed.** Figure conversion
+  matched the literal token `\includegraphics{`, so every call with an
+  optional argument — i.e. essentially all of them — skipped PDF→PNG
+  conversion, and raw PDFs got embedded into the `.docx`, which Word cannot
+  display.
+- **`\graphicspath` and extension-less names were ignored.** Only literal
+  `.pdf`/`.eps` names in the main directory resolved.
+- **Cross-references to user-defined sectioning macros were dead.** A macro
+  such as `\appsection` that steps its own counter fell through the label map,
+  so every `\cref{app:…}` printed the raw label text. `counters.py` now reads
+  the preamble the way LaTeX does — `\newcounter`, `\the…`, `\crefname`,
+  `\refstepcounter` inside macro bodies — and simulates the counters.
+- **Equation cross-references** (`\cref{eq:…}`) were unresolved for the same
+  reason.
+- **Comments were parsed as code**, so an `\appsection` mentioned in a `%`
+  comment shifted every appendix letter by one.
+- **Supplementary figures were misnumbered.** Captions were numbered by
+  position, ignoring `\setcounter{figure}{0}` plus
+  `\renewcommand{\thefigure}{S\arabic{figure}}` — so "Figure S1" came out as
+  "Figure 6" while the cross-reference pointing at it said something else.
+- **The password had a hard-coded fallback** in the source of this repository.
+
+If an `.aux` file from a real LaTeX run is available, pass `--aux main.aux`
+and its numbers are used instead of OWL's reconstruction — LaTeX is always
+right about its own numbering.
+
+---
+
+## Fixed in this pass
+
+- **Figures were the wrong size.** Widths were collected by scanning every
+  `\includegraphics` in the raw source, including one inside a `%` comment in
+  the preamble and one whose file was missing. Both shift the positional
+  mapping, so every picture got another picture's width — the first real
+  figure fell back to its natural size, about 38% of the text width instead of
+  the 85% the LaTeX asked for. Widths are now collected *during* the rewrite,
+  only for figures that actually resolve, so the list cannot drift out of step
+  with the images pandoc emits. Absolute units (`width=2in`, `3cm`, `100pt`)
+  are honoured too.
+- **`\textcolor` was dropped entirely.** pandoc has no colour model for the
+  LaTeX reader, so a document using red for open questions and green for
+  settled ones arrived uniformly black. `colors.py` reads `\definecolor` —
+  respecting the case-sensitive difference between xcolor's `{rgb}` fractions
+  and `{RGB}` integers — and re-applies real `w:color` runs, including across
+  runs that pandoc split for emphasis, maths or links.
+- **Comments are stripped before preprocessing**, so nothing commented out is
+  ever treated as content.
+
+## Page-faithful mode — status: close, not converged
+
+The goal: every Word page starts and ends on the same word as the compiled
+LaTeX PDF, with one uniform text-block width for the whole document.
+
+Working and verified:
+
+- **`pdfprose.py`** extracts the *prose* of the PDF, page by page. Raw
+  `pdftotext` is unusable here because it also returns axis labels and legends
+  drawn inside figures, which do not exist in the Word file and inflate every
+  page's word count. Filtering on the document's dominant font and size
+  separates body text from figure internals, and caption blocks are cut by
+  matching the caption text taken from the LaTeX source.
+- **`floats.py`** reads each float's real page and top/bottom placement out of
+  the PDF, and moves the corresponding Word block there. This matters because
+  LaTeX *floats* figures and Word does not, so the same document genuinely has
+  its figures in different places in the two outputs. All 14 floats in the
+  test document are placed correctly.
+- **`pagefit.py`** aligns the two word streams, splits paragraphs at the
+  boundaries and sets `pageBreakBefore`, hiding the seam with last-line
+  justification; widens the text block uniformly and re-renders; then verifies
+  every page's first word, last word and prose word count against the PDF and
+  loops.
+
+Not yet converged: the document still renders four pages longer than the
+LaTeX original at the tightest setting, and page verification passes on only a
+handful of pages. Two things need doing — the section breaks the postprocessor
+inserts for appendix page numbering are not part of the boundary map and add
+pages of their own, and the loop needs a real per-page overflow measurement
+rather than inferring it from the total page count.
+
+It is **not exposed in the UI**. Do not enable it expecting exact pages.
+
+## Deploy free on Streamlit Community Cloud
+
+1. Push this folder to a GitHub repo.
+2. share.streamlit.io → **Create app** → branch `main`, main file `app.py`.
+3. **Advanced → Secrets:**
    ```toml
    OWL_PASSWORD = "your-password-here"
    ```
-4. Click **Deploy**. First build takes a few minutes (it installs the tools in
-   `packages.txt`). You get a URL like `https://owl-schauer.streamlit.app`.
-5. Every time you push to GitHub, it redeploys automatically.
+4. Deploy. `packages.txt` (apt) and `requirements.txt` (pip) install
+   automatically. Every push redeploys.
 
-`packages.txt` (apt) and `requirements.txt` (pip) are read automatically — you
-don't install anything by hand on the server.
-
----
-
-## Deploy free on Hugging Face Spaces  (alternative, CPU tier)
-
-1. Create a **Space** → SDK **Streamlit** → free CPU hardware.
-2. Upload these files (or connect the GitHub repo).
-3. Add `OWL_PASSWORD` under the Space's **Settings → Secrets**.
-4. `packages.txt` + `requirements.txt` are honored the same way. It builds and
-   serves at `https://huggingface.co/spaces/<you>/owl`.
+`packages.txt` deliberately does **not** install `libreoffice-writer` any
+more: nothing in the conversion path used it, and it added hundreds of
+megabytes to every build.
 
 ---
 
-## Wiring it into the website
-
-The website's **OWL** tab (password-gated) has a **Launch OWL** button. Once the
-app is deployed, set that button's link to your `…streamlit.app` (or HF Spaces)
-URL and it opens the converter. The app has its own password gate too, so the
-URL isn't wide open.
-
----
-
-## Files
-
-| file | purpose |
-|------|---------|
-| `app.py` | the Streamlit web app (gate, upload, mode, convert, download) |
-| `tex2docx.py` | the conversion engine (editable + `--zotero`) |
-| `reference.docx` | Word style template (Times New Roman, 12 pt, single, 1 in) |
-| `american-chemical-society.csl` | ACS citation style |
-| `requirements.txt` | Python deps (pip) |
-| `packages.txt` | system deps (apt) — pandoc, poppler, libreoffice |
-| `.streamlit/config.toml` | dark-emerald theme + upload size |
-
-## Note on fidelity
-
-Editable output is **close, not pixel-identical** — Word and LaTeX break lines
-differently, so page breaks drift. For a look-identical copy, hand over the
-compiled Overleaf **PDF**. This tool is the *editable* hand-off.
+© 2026 David G. Schauer · All rights reserved. OWL — the app, workflow and
+code — is an original work of the author. It builds on the open-source
+[pandoc](https://pandoc.org) and
+[python-docx](https://python-docx.readthedocs.io) projects.

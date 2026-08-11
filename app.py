@@ -1,32 +1,19 @@
-"""
-OWL — Overleaf · Word · LaTeX
-A Streamlit front-end for tex2docx.py: upload your Overleaf sources, pick a
-mode, download an editable Word (.docx). Deployable free on Streamlit
-Community Cloud or Hugging Face Spaces (CPU). No GPU, no LaTeX install needed.
+"""OWL — Overleaf · Word · LaTeX.
+
+A thin Streamlit front end.  All conversion logic lives in `owlkit`, so the UI
+cannot drift away from the CLI, and both refuse the same bad input for the
+same reasons.
 """
 
-import os
 import io
-import re
-import sys
+import os
 import shutil
-import zipfile
 import tempfile
-import subprocess
+import zipfile
 
 import streamlit as st
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-TEX2DOCX = os.path.join(HERE, "tex2docx.py")
-
-# ── shared access password ────────────────────────────────────────────────
-# Set OWL_PASSWORD in Streamlit "Secrets" (recommended). Falls back to the
-# default below if no secret is configured.
-def get_password():
-    try:
-        return st.secrets["OWL_PASSWORD"]
-    except Exception:
-        return "xX2357Xx"
+from owlkit import convert, ConversionError
 
 st.set_page_config(page_title="OWL · Overleaf → Word", page_icon="🦉",
                    layout="centered")
@@ -47,9 +34,11 @@ st.markdown("""
     background:#34D399; color:#04110B; border:none; border-radius:99px;
     font-weight:600; padding:.5rem 1.4rem; }
   .stButton>button:hover, .stDownloadButton>button:hover { background:#6EE7B7; }
-  .owl-card { border:1px solid rgba(52,211,153,.28); border-radius:14px;
-    background:rgba(255,255,255,.03); padding:1rem 1.2rem; margin:.4rem 0; }
   .owl-note { font-size:.82rem; color:#B7C2BC; line-height:1.7; }
+  .owl-issue { font-family:'JetBrains Mono',monospace; font-size:.8rem;
+    border-left:3px solid #F87171; padding:.4rem .8rem; margin:.35rem 0;
+    background:rgba(248,113,113,.07); }
+  .owl-warn { border-left-color:#FBBF24; background:rgba(251,191,36,.07); }
   code { color:#6EE7B7; }
 </style>
 """, unsafe_allow_html=True)
@@ -59,17 +48,30 @@ st.markdown('<p class="owl-sub">Overleaf · Word · LaTeX — one upload, a Word
             unsafe_allow_html=True)
 st.write("")
 
+
 # ── password gate ──────────────────────────────────────────────────────────
+def get_password():
+    try:
+        return st.secrets["OWL_PASSWORD"]
+    except Exception:
+        return None
+
+
 if "owl_ok" not in st.session_state:
     st.session_state.owl_ok = False
 
 if not st.session_state.owl_ok:
     st.markdown("#### 🔒 Access")
-    st.caption("This converter is password protected.")
+    expected = get_password()
+    if not expected:
+        st.error("No access password is configured. Set `OWL_PASSWORD` in the "
+                 "app's Secrets.")
+        st.stop()
     pw = st.text_input("Access password", type="password",
-                       label_visibility="collapsed", placeholder="Enter access password")
+                       label_visibility="collapsed",
+                       placeholder="Enter access password")
     if st.button("Unlock"):
-        if pw == get_password():
+        if pw == expected:
             st.session_state.owl_ok = True
             st.rerun()
         else:
@@ -78,46 +80,46 @@ if not st.session_state.owl_ok:
                "OWL is an original tool by the author.")
     st.stop()
 
+
 # ── helpers ────────────────────────────────────────────────────────────────
 def find_main_tex(root):
-    """Pick the .tex that contains \\documentclass (the main file); fall back
-    to \\begin{document}, then to the only/first .tex."""
+    """The .tex holding \\documentclass is the main file."""
     texs = []
-    for dp, _, files in os.walk(root):
+    for dirpath, _, files in os.walk(root):
+        if "__MACOSX" in dirpath:
+            continue
         for f in files:
             if f.lower().endswith(".tex"):
-                texs.append(os.path.join(dp, f))
-    if not texs:
-        return None
-    for t in texs:
-        try:
-            s = open(t, encoding="utf-8", errors="ignore").read()
-            if "\\documentclass" in s:
-                return t
-        except Exception:
-            pass
-    for t in texs:
-        try:
-            if "\\begin{document}" in open(t, encoding="utf-8", errors="ignore").read():
-                return t
-        except Exception:
-            pass
-    return texs[0]
+                texs.append(os.path.join(dirpath, f))
+    for probe in ("\\documentclass", "\\begin{document}"):
+        for t in texs:
+            try:
+                with open(t, encoding="utf-8", errors="ignore") as fh:
+                    if probe in fh.read():
+                        return t
+            except OSError:
+                pass
+    return texs[0] if texs else None
 
-def run_convert(workdir, main_tex, zotero):
-    cmd = [sys.executable, TEX2DOCX, main_tex]
-    if zotero:
-        cmd.append("--zotero")
-    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=workdir)
-    return proc
 
-# ── main UI ────────────────────────────────────────────────────────────────
+def show_issues(issues, kind="error"):
+    css = "owl-issue" if kind == "error" else "owl-issue owl-warn"
+    for i in issues:
+        where = f"Line {i.line} — " if i.line else ""
+        hint = f"<br><span style='opacity:.75'>→ {i.hint}</span>" if i.hint else ""
+        st.markdown(f'<div class="{css}"><b>{where}</b>{i.message}{hint}</div>',
+                    unsafe_allow_html=True)
+
+
+# ── upload ─────────────────────────────────────────────────────────────────
 st.markdown("### 1 · Upload your Overleaf sources")
 st.markdown(
-    '<p class="owl-note">Easiest: in Overleaf use <b>Menu → Download → Source</b> '
-    'and upload that <code>.zip</code> here (it already contains your '
-    '<code>.tex</code>, <code>references.bib</code>, and figures). '
-    'Or upload the individual files below.</p>', unsafe_allow_html=True)
+    '<p class="owl-note">In Overleaf use <b>Menu → Download → Source</b> and '
+    'upload that <code>.zip</code> — it already contains your <code>.tex</code>, '
+    '<code>references.bib</code> and figures. Without the <code>.bib</code> '
+    'every citation and the whole reference list are lost, so OWL will stop '
+    'and tell you rather than hand you a document that quietly dropped them.</p>',
+    unsafe_allow_html=True)
 
 up_zip = st.file_uploader("Overleaf source .zip", type=["zip"])
 with st.expander("…or upload individual files instead"):
@@ -126,39 +128,38 @@ with st.expander("…or upload individual files instead"):
     up_figs = st.file_uploader("figures (png / jpg / pdf / eps)",
                                accept_multiple_files=True)
 
-st.markdown(
-    '<p class="owl-note">Optional: also drop in your <b>compiled PDF</b> '
-    '(Overleaf → Download → PDF) and it gets added to the download bundle. '
-    'The Overleaf <em>source</em> zip doesn\'t contain the PDF, so upload it '
-    'here if you want it included.</p>', unsafe_allow_html=True)
-up_pdf = st.file_uploader("Compiled PDF (optional)", type=["pdf"])
+up_pdf = st.file_uploader("Compiled PDF (optional — added to the bundle)",
+                          type=["pdf"])
 
 st.markdown("### 2 · Convert")
 st.markdown(
     '<p class="owl-note">Produces an <b>editable Word</b> document — Times New '
-    'Roman, justified, title page, running header, real Word equations, and '
-    'clickable ACS citations built from your <code>.bib</code>. You get back a '
-    '<b>zip</b> with the Word file, your compiled PDF (if provided), the '
-    '<code>.bib</code>, and all figures.</p>', unsafe_allow_html=True)
-zotero = False
+    'Roman, justified, title page, running header, real Word equations, '
+    'numbered figure and table captions, clickable cross-references, and a '
+    'static ACS reference list built from your <code>.bib</code> with live '
+    'DOI links.</p>', unsafe_allow_html=True)
 
-go = st.button("Convert to Word →", type="primary")
+strict = st.checkbox("Stop if the LaTeX has problems (recommended)", value=True,
+                     help="Uncheck to convert anyway. Citations may be lost "
+                          "and cross-references may print as raw labels.")
 
-if go:
+if st.button("Convert to Word →", type="primary"):
     workdir = tempfile.mkdtemp(prefix="owl_")
     try:
-        # materialise the uploads into one flat working directory
         if up_zip is not None:
             with zipfile.ZipFile(io.BytesIO(up_zip.read())) as z:
                 z.extractall(workdir)
         elif up_tex is not None:
-            open(os.path.join(workdir, "main.tex"), "wb").write(up_tex.getbuffer())
+            with open(os.path.join(workdir, "main.tex"), "wb") as fh:
+                fh.write(up_tex.getbuffer())
             if up_bib is not None:
-                open(os.path.join(workdir, up_bib.name), "wb").write(up_bib.getbuffer())
+                with open(os.path.join(workdir, up_bib.name), "wb") as fh:
+                    fh.write(up_bib.getbuffer())
             for f in (up_figs or []):
-                open(os.path.join(workdir, f.name), "wb").write(f.getbuffer())
+                with open(os.path.join(workdir, f.name), "wb") as fh:
+                    fh.write(f.getbuffer())
         else:
-            st.warning("Please upload your Overleaf .zip (or at least a .tex file).")
+            st.warning("Please upload your Overleaf .zip (or at least a .tex).")
             st.stop()
 
         main_tex = find_main_tex(workdir)
@@ -166,91 +167,94 @@ if go:
             st.error("No .tex file found in the upload.")
             st.stop()
 
-        # optional compiled PDF -> save next to the sources for bundling
-        if up_pdf is not None:
-            pdf_name = os.path.splitext(os.path.basename(main_tex))[0] + ".pdf"
-            open(os.path.join(os.path.dirname(main_tex), pdf_name), "wb").write(up_pdf.getbuffer())
-
-        with st.spinner("Converting with pandoc…"):
-            proc = run_convert(os.path.dirname(main_tex), main_tex, zotero)
-
-        # locate the produced .docx
-        base = os.path.splitext(main_tex)[0]
-        out = base + ".docx"
-        if proc.returncode != 0 or not os.path.exists(out):
-            st.error("Conversion failed. Details below.")
-            st.code((proc.stderr or proc.stdout or "no output")[-3000:])
-            st.stop()
-
-        # ── assemble the download bundle: Word + PDF + .bib + figures ──
         srcdir = os.path.dirname(main_tex)
         paper = os.path.splitext(os.path.basename(main_tex))[0]
+        if up_pdf is not None:
+            with open(os.path.join(srcdir, paper + ".pdf"), "wb") as fh:
+                fh.write(up_pdf.getbuffer())
+
+        log_lines = []
+        with st.spinner("Checking the source and converting…"):
+            try:
+                result = convert(main_tex, strict=strict,
+                                 on_log=log_lines.append)
+            except ConversionError as e:
+                st.error(str(e))
+                if e.issues:
+                    show_issues(e.issues, "error")
+                if e.detail:
+                    with st.expander("pandoc output"):
+                        st.code(e.detail)
+                st.stop()
+
+        if result.warnings:
+            with st.expander(f"⚠ {len(result.warnings)} warning(s) — "
+                             f"the file was still produced"):
+                show_issues(result.warnings, "warning")
+
+        # ── bundle ──────────────────────────────────────────────────────
+        out = result.docx_path
         IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".eps", ".pdf",
                    ".svg", ".tif", ".tiff")
-        bundle = io.BytesIO()
-        included = []
+        pdf_path = os.path.join(srcdir, paper + ".pdf")
+        bundle, included = io.BytesIO(), []
         with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as z:
-            # the converted Word file
             z.write(out, os.path.basename(out))
             included.append(os.path.basename(out))
-            # the compiled PDF, if the user supplied one
-            pdf_path = os.path.join(srcdir, paper + ".pdf")
             if up_pdf is not None and os.path.exists(pdf_path):
                 z.write(pdf_path, paper + ".pdf")
                 included.append(paper + ".pdf")
-            # the bibliography
-            for f in os.listdir(srcdir):
+            for f in sorted(os.listdir(srcdir)):
                 if f.lower().endswith(".bib"):
                     z.write(os.path.join(srcdir, f), f)
                     included.append(f)
-            # every figure / image, under figures/
-            for dp, _, files in os.walk(srcdir):
-                for f in files:
+            seen = set()
+            for dirpath, _, files in os.walk(srcdir):
+                if "__MACOSX" in dirpath:
+                    continue
+                for f in sorted(files):
                     low = f.lower()
-                    if not low.endswith(IMG_EXT):
+                    if not low.endswith(IMG_EXT) or low.endswith("_conv.png"):
                         continue
-                    if low.endswith("_conv.png"):        # skip our auto-conversions
-                        continue
-                    full = os.path.join(dp, f)
+                    full = os.path.join(dirpath, f)
                     if os.path.abspath(full) == os.path.abspath(pdf_path):
-                        continue                          # already added as the paper PDF
-                    rel = os.path.relpath(full, srcdir)
-                    z.write(full, os.path.join("figures", os.path.basename(rel)))
-                    included.append("figures/" + os.path.basename(rel))
+                        continue
+                    if f in seen:
+                        continue
+                    seen.add(f)
+                    z.write(full, os.path.join("figures", f))
+                    included.append("figures/" + f)
         bundle.seek(0)
 
         n_fig = sum(1 for x in included if x.startswith("figures/"))
-        st.success(f"Done — bundled {len(included)} files "
+        st.success(f"Done — {len(included)} files bundled "
                    f"({n_fig} figure{'s' if n_fig != 1 else ''}).")
         st.download_button("⬇ Download bundle (.zip)", bundle.getvalue(),
-                           file_name=f"{paper}_bundle.zip", mime="application/zip",
-                           type="primary")
+                           file_name=f"{paper}_bundle.zip",
+                           mime="application/zip", type="primary")
+        with open(out, "rb") as fh:
+            st.download_button("…or just the Word file", fh.read(),
+                               file_name=os.path.basename(out),
+                               mime="application/vnd.openxmlformats-officedocument."
+                                    "wordprocessingml.document")
         with st.expander("what's in the zip"):
             st.write("\n".join("• " + x for x in included))
-            if up_pdf is None:
-                st.info("No compiled PDF included — upload one above if you want it "
-                        "in the bundle.")
-        # also offer the Word file on its own
-        st.download_button("…or just the Word file", open(out, "rb").read(),
-                           file_name=os.path.basename(out),
-                           mime="application/vnd.openxmlformats-officedocument."
-                                "wordprocessingml.document")
-        if proc.stdout.strip():
-            with st.expander("conversion log"):
-                st.code(proc.stdout)
+        with st.expander("conversion log"):
+            st.code("\n".join(log_lines))
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
-# ── footer notes ───────────────────────────────────────────────────────────
+
+# ── footer ─────────────────────────────────────────────────────────────────
 st.markdown("---")
-with st.expander("ℹ️  Good to know — editable is close, not pixel-identical"):
+with st.expander("ℹ️  Editable is close, not pixel-identical"):
     st.markdown("""
 Word re-wraps text with its own line-breaking engine (greedy first-fit) while
-LaTeX uses Knuth–Plass total-fit, the “Times” font files differ slightly, and
-Word lacks LaTeX hyphenation/microtype — so **line and page breaks will drift**
-even with identical fonts and margins. That's a property of the two systems, not
-a setting. If a reader needs it to *look* pixel-for-pixel identical, just hand
-them the compiled Overleaf **PDF** — this tool is for the **editable** hand-off.
+LaTeX uses Knuth–Plass total-fit, the "Times" font files differ slightly, and
+Word has no LaTeX hyphenation or microtype — so **line and page breaks drift**
+even with identical fonts and margins. That is a property of the two systems,
+not a setting. If a reader needs it to *look* identical, hand them the compiled
+Overleaf **PDF**; this tool is for the **editable** hand-off.
 """)
 st.caption("OWL · built on pandoc + python-docx · no LaTeX install required.")
 st.caption("© 2026 David G. Schauer · All rights reserved. OWL — the app, workflow "
