@@ -388,18 +388,15 @@ def split_paragraph_at(para, run, offset):
     for ch in tail_children[:keep_from]:
         tail_el.remove(ch)
 
-    # Justify the head's final line so the seam is invisible -- but only when
-    # the head actually keeps some text.  Stretching an empty or one-word
-    # remnant across the measure is worse than the seam it hides.
-    head_text = "".join(t.text or "" for t in p_el.iter(qn("w:t")))
-    if len(head_text.split()) >= 6:
-        head_pPr = _pPr(p_el)
-        jc = head_pPr.find(qn("w:jc"))
-        if jc is None:
-            jc = head_pPr.makeelement(qn("w:jc"), {})
-            head_pPr.append(jc)
-        if jc.get(qn("w:val")) in (None, "both", "justify"):
-            jc.set(qn("w:val"), "distribute")
+    # Deliberately NOT stretching the head's last line.
+    #
+    # An earlier version set w:jc="distribute" here, so the final line of the
+    # part left on the previous page was spread across the full measure to
+    # disguise the split.  It disguises nothing -- it produces
+    # "l e n g t h   a n d   t u n e" -- and it is not what LaTeX does either.
+    # Ordinary justification leaves the last line of a paragraph ending where
+    # its words end, and a paragraph continued on the next page should look no
+    # different.  The head keeps whatever alignment the paragraph already had.
 
     tail_pPr = _pPr(tail_el)
     ind = tail_pPr.find(qn("w:ind"))
