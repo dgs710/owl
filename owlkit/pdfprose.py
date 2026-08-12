@@ -161,8 +161,21 @@ def strip_running_heads(pages):
     if len(pages) < 3:
         return pages
 
+    roman = re.compile(r"^[ivxlcdmIVXLCDM]+$")
+
     def shape(seq):
-        return " ".join("#" if w.isdigit() else w for w in seq)
+        # the page number in a running head may be arabic OR roman -- an
+        # appendix commonly renumbers to i, ii, iii... and leaving those as
+        # literal words means no two headers share a shape, so none of them
+        # ever reaches the repetition threshold and the numbers leak into the
+        # body word stream as if they were prose.
+        out = []
+        for w in seq:
+            if w.isdigit() or roman.match(w):
+                out.append("#")
+            else:
+                out.append(w)
+        return " ".join(out)
 
     firsts = Counter(shape(p[:6]) for p in pages if p)
     lasts = Counter(shape(p[-6:]) for p in pages if p)

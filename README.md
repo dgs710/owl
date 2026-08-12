@@ -123,38 +123,44 @@ right about its own numbering.
 - **Comments are stripped before preprocessing**, so nothing commented out is
   ever treated as content.
 
-## Page-faithful mode — status: close, not converged
+## Page-faithful mode — status: measurably better, still not exact
 
-The goal: every Word page starts and ends on the same word as the compiled
-LaTeX PDF, with one uniform text-block width for the whole document.
+Goal: every Word page starts and ends on the same word as the compiled LaTeX
+PDF, with one uniform text-block width for the whole document.
 
-Working and verified:
+Measured on the reference document (36-page LaTeX PDF, 14 floats, real
+bibliography): the plain conversion already produces **36 pages**, and 5 of
+them match the PDF exactly, with most of the rest lagging by a single page
+from the middle of the document onward. With page-fitting engaged the run
+lands at 40–41 pages and 6 exact matches — i.e. the machinery is not yet
+paying for itself, and the plain conversion is currently the better output.
 
-- **`pdfprose.py`** extracts the *prose* of the PDF, page by page. Raw
-  `pdftotext` is unusable here because it also returns axis labels and legends
-  drawn inside figures, which do not exist in the Word file and inflate every
-  page's word count. Filtering on the document's dominant font and size
-  separates body text from figure internals, and caption blocks are cut by
-  matching the caption text taken from the LaTeX source.
-- **`floats.py`** reads each float's real page and top/bottom placement out of
-  the PDF, and moves the corresponding Word block there. This matters because
-  LaTeX *floats* figures and Word does not, so the same document genuinely has
-  its figures in different places in the two outputs. All 14 floats in the
-  test document are placed correctly.
-- **`pagefit.py`** aligns the two word streams, splits paragraphs at the
-  boundaries and sets `pageBreakBefore`, hiding the seam with last-line
-  justification; widens the text block uniformly and re-renders; then verifies
-  every page's first word, last word and prose word count against the PDF and
-  loops.
+What is solved:
 
-Not yet converged: the document still renders four pages longer than the
-LaTeX original at the tightest setting, and page verification passes on only a
-handful of pages. Two things need doing — the section breaks the postprocessor
-inserts for appendix page numbering are not part of the boundary map and add
-pages of their own, and the loop needs a real per-page overflow measurement
-rather than inferring it from the total page count.
+- **`pdfprose.py`** extracts prose by filtering on the document's dominant
+  font and size (PyMuPDF), which cleanly separates 12 pt body text from the
+  5–8 pt labels drawn inside figures. Raw `pdftotext` mixes them and makes
+  every per-page word count wrong.
+- **Captions and table bodies are excluded** by matching the text taken from
+  the LaTeX source, not by guessing from vertical gaps. A table's body is
+  body-font text in the PDF but a detached float block in Word; leaving it in
+  skewed several pages badly.
+- **Running heads** are stripped even when the appendix renumbers to roman
+  numerals — otherwise no two headers share a shape, none reaches the
+  repetition threshold, and page numbers leak into the body word stream.
+- **Float placement**: each float's real page and top/bottom position is read
+  from the PDF and the Word block is moved there. All 14 place correctly.
+- **Float-only pages** (a full-page figure with no prose) no longer produce a
+  blank prose page *and* a figure page.
+- **Section breaks** inserted for appendix page numbering no longer stack with
+  an inserted break to leave a blank page.
 
-It is **not exposed in the UI**. Do not enable it expecting exact pages.
+What is left: the fit still lands 4–5 pages long, and the loop tightens on the
+total page count rather than finding the first page that actually overflows —
+so it cannot tell which page needs the room. That per-page overflow
+measurement is the next piece.
+
+It is **not exposed in the UI**. The plain conversion is what the app ships.
 
 ## Deploy free on Streamlit Community Cloud
 

@@ -302,35 +302,6 @@ def split_paragraph_at(para, run, offset):
     return tail_el
 
 
-def apply_boundaries(doc, sites, indices):
-    """Turn each mapped word index into a real page start.
-
-    Returns {page_number: paragraph_element} for every page after the first.
-    """
-    starts = {}
-    ordered = [(page_no, idx) for page_no, idx in enumerate(indices, start=2)
-               if idx is not None and idx < len(sites)]
-    # back to front: splitting a later paragraph cannot disturb earlier sites
-    for page_no, idx in sorted(ordered, key=lambda t: t[1], reverse=True):
-        para, run, offset = sites[idx]
-        tail = split_paragraph_at(para, run, offset)
-        _set_page_break_before(tail, True)
-        starts[page_no] = tail
-    return starts
-
-
-def strip_existing_page_breaks(doc):
-    """Remove page breaks that came from \\clearpage etc. -- the ground-truth
-    map already accounts for every break in the PDF."""
-    removed = 0
-    for br in doc.element.body.iter(qn("w:br")):
-        if br.get(qn("w:type")) == "page":
-            parent = br.getparent()
-            parent.remove(br)
-            removed += 1
-    return removed
-
-
 # ---------------------------------------------------------------------------
 # uniform density controls
 # ---------------------------------------------------------------------------
@@ -481,6 +452,90 @@ def caption_index(tex_src):
     return out
 
 
+def strip_existing_page_breaks(doc):
+    """Remove page breaks that came from \\clearpage etc. -- the ground-truth
+    map already accounts for every break in the PDF."""
+    removed = 0
+    for br in list(doc.element.body.iter(qn("w:br"))):
+        if br.get(qn("w:type")) == "page":
+            parent = br.getparent()
+            parent.remove(br)
+            removed += 1
+    for pPr in list(doc.element.body.iter(qn("w:pPr"))):
+        for pbb in pPr.findall(qn("w:pageBreakBefore")):
+            pPr.remove(pbb)
+            removed += 1
+    return removed
+
+
+def section_break_paragraphs(doc):
+    """Paragraphs carrying an inline <w:sectPr>.
+
+    The postprocessor creates sections so the appendix can renumber its pages.
+    A section break is itself a page break, so if a ground-truth boundary lands
+    on the same spot and we also set pageBreakBefore, Word emits *two* breaks
+    and leaves a blank page -- which then cascades through every later
+    boundary.
+    """
+    out = []
+    for p in doc.element.body.findall(qn("w:p")):
+        pPr = p.find(qn("w:pPr"))
+        if pPr is not None and pPr.find(qn("w:sectPr")) is not None:
+            out.append(p)
+    return out
+
+
+def drop_redundant_breaks(doc):
+    """Where a section break already starts a page, remove our own break."""
+    dropped = 0
+    body = doc.element.body
+    children = list(body)
+    for p in section_break_paragraphs(doc):
+        try:
+            idx = children.index(p)
+        except ValueError:
+            continue
+        for nxt in children[idx + 1:]:
+            if nxt.tag != qn("w:p"):
+                break
+            pPr = nxt.find(qn("w:pPr"))
+            if pPr is not None and pPr.find(qn("w:pageBreakBefore")) is not None:
+                pPr.remove(pPr.find(qn("w:pageBreakBefore")))
+                dropped += 1
+            break
+    return dropped
+
+
+def apply_boundaries(doc, sites, indices, prose_pages=None):
+    """Turn each mapped word index into a real page start.
+
+    `prose_pages` marks which pages actually carry body text.  A page holding
+    nothing but a full-width figure has no prose at all, so two consecutive
+    boundaries land on the same word; splitting there anyway manufactures an
+    empty paragraph, and the figure then arrives on a page of its own -- two
+    Word pages where LaTeX has one.  Those pages are skipped here and the
+    float is made the page start instead.
+
+    Returns {page_number: element_that_starts_it}.
+    """
+    starts = {}
+    ordered = []
+    for page_no, idx in enumerate(indices, start=2):
+        if idx is None or idx >= len(sites):
+            continue
+        if prose_pages is not None and not prose_pages.get(page_no, True):
+            continue
+        ordered.append((page_no, idx))
+
+    # back to front: splitting a later paragraph cannot disturb earlier sites
+    for page_no, idx in sorted(ordered, key=lambda t: t[1], reverse=True):
+        para, run, offset = sites[idx]
+        tail = split_paragraph_at(para, run, offset)
+        _set_page_break_before(tail, True)
+        starts[page_no] = tail
+    return starts
+
+
 def build_candidate(docx_path, pdf_words, counts, placements, density):
     """One attempt: apply a density, re-place the floats where the PDF has
     them, and split the prose at the ground-truth page boundaries."""
@@ -495,28 +550,54 @@ def build_candidate(docx_path, pdf_words, counts, placements, density):
 
     words, sites = docx_word_stream(doc)
     mapped = align_boundaries(pdf_words, counts, words)
-    starts = apply_boundaries(doc, sites, mapped)
 
-    placed, orphaned = 0, []
+    # which pages carry prose at all (page 1 always does -- it is the cover)
+    prose_pages = {n: counts[n - 1] > 0 for n in range(1, len(counts) + 1)}
+    starts = apply_boundaries(doc, sites, mapped, prose_pages)
+
+    body = doc.element.body
+
+    def anchor_after(page_no):
+        """The element that begins the first prose page at or after page_no."""
+        for n in range(page_no, len(counts) + 2):
+            if n in starts:
+                return starts[n]
+        return None
+
+    # place the floats last-page-first so earlier insertions stay valid
+    by_page = []
     for kind, num, group in blocks:
         target = placements.get((kind, num))
         if target is None:
+            by_page.append((10 ** 6, kind, num, group, None))
+        else:
+            by_page.append((target[0] + 1, kind, num, group, target[1]))
+
+    placed, orphaned = 0, []
+    for page_no, kind, num, group, where in sorted(by_page, reverse=True):
+        if where is None:
             orphaned.append(f"{kind} {num}")
             continue
-        page_idx, where = target
-        page_no = page_idx + 1
-        anchor = starts.get(page_no if where == "top" else page_no + 1)
+        # a float at the top of page P goes before P's own start; one at the
+        # bottom goes before the start of P+1
+        anchor = anchor_after(page_no if where == "top" else page_no + 1)
         if anchor is None:
-            orphaned.append(f"{kind} {num}")
+            body.append(group[0])
+            for el in group[1:]:
+                group[0].addnext(el)
+            placed += 1
             continue
         for el in group:
             anchor.addprevious(el)
-        if where == "top":
-            # the float now leads the page, so it must carry the break
-            _set_page_break_before(anchor, False)
+        if where == "top" or not prose_pages.get(page_no, True):
+            # the float leads its page, so it carries the break, not the prose
+            if where == "top" and page_no in starts:
+                _set_page_break_before(starts[page_no], False)
             _set_page_break_before(group[0], True)
             starts[page_no] = group[0]
         placed += 1
+
+    drop_redundant_breaks(doc)
     return doc, len(starts), placed, orphaned
 
 
@@ -559,7 +640,7 @@ def fit(docx_path, target_pdf, tex_src, out_path, log=print, max_rounds=10,
             f"{good}/{len(checks)} pages verified, {n_floats} floats, "
             f"{imgs} images")
 
-        score = (good, pages == target_pages)
+        score = (good, -abs(pages - target_pages))
         if best is None or score > best[0]:
             best = (score, candidate, rendered, d, pages, checks, orphaned, imgs)
 

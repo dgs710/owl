@@ -209,6 +209,7 @@ def source_captions(tex_src):
         if not cm:
             out.append((kind, []))
             continue
+
         depth, j = 1, cm.end()
         while j < len(chunk) and depth:
             if chunk[j] == "\\":
@@ -219,6 +220,20 @@ def source_captions(tex_src):
             elif chunk[j] == "}":
                 depth -= 1
             j += 1
+        # a table's *body* is prose-font text in the PDF but a detached float
+        # block in the Word file, so it has to come out of the comparison too
+        extra = []
+        if kind == "Table":
+            tb = re.search(r"\\begin\{tabular[xy*]?\}", chunk)
+            if tb:
+                te = chunk.find("\\end{tabular", tb.end())
+                cells = chunk[tb.end():te if te != -1 else len(chunk)]
+                cells = re.sub(r"\\\\|&", " ", cells)
+                cells = re.sub(r"\\(?:textcolor|colorbox)\s*\{[^}]*\}", " ", cells)
+                cells = re.sub(r"\\[a-zA-Z]+\s*(?:\[[^\]]*\])?", " ", cells)
+                cells = re.sub(r"[{}$~]", " ", cells)
+                extra = re.findall(r"[0-9A-Za-z][0-9A-Za-z'.-]*", cells)
+
         text = chunk[cm.end():j - 1]
         # drop the *first* argument of two-argument markup so its value does
         # not leak into the caption words (\textcolor{red}{...} -> ...)
@@ -226,5 +241,6 @@ def source_captions(tex_src):
         text = re.sub(r"\\label\s*\{[^}]*\}", " ", text)
         text = re.sub(r"\\[a-zA-Z]+\s*(?:\[[^\]]*\])?", " ", text)
         text = re.sub(r"[{}$~\\\\]", " ", text)
-        out.append((kind, [w for w in re.findall(r"[0-9A-Za-z][0-9A-Za-z'-]*", text)]))
+        words = re.findall(r"[0-9A-Za-z][0-9A-Za-z'-]*", text)
+        out.append((kind, words + extra))
     return out
