@@ -55,15 +55,21 @@ FORMATTERS = {
     "Roman": lambda n: _roman(n).upper(),
 }
 
-# Default cleveref display names for the counters LaTeX defines itself.
+# cleveref's own default names -- note that several are ABBREVIATED, which is
+# easy to miss: \cref{fig:x} prints "fig. 3", not "figure 3", and an equation
+# reference prints "eq. (1)" with the number in parentheses.  Emitting
+# "Figure 3" where the LaTeX says "Fig. 3" is a real difference in the text.
 DEFAULT_CREFNAMES = {
-    "section": "Section",
-    "subsection": "Section",
-    "subsubsection": "Section",
-    "figure": "Figure",
-    "table": "Table",
-    "equation": "Equation",
+    "section": ("section", "sections"),
+    "subsection": ("section", "sections"),
+    "subsubsection": ("section", "sections"),
+    "figure": ("fig.", "figs."),
+    "table": ("table", "tables"),
+    "equation": ("eq.", "eqs."),
 }
+
+# counters whose reference number is printed in parentheses
+PARENTHESISED = {"equation"}
 
 
 class CounterModel:
@@ -75,6 +81,10 @@ class CounterModel:
         self.crefnames = {}       # counter -> display name
         self.macro_steps = {}     # macro name -> counter it \refstepcounter's
         self.parents = {}         # counter -> parent counter (for "2.1" style)
+        self.crefnames_plural = {}
+        # \usepackage[capitalise]{cleveref} makes \cref capitalise like \Cref
+        self.capitalise = False
+        self.label_counter = {}   # label -> the counter it belongs to
 
     # -- formatting ------------------------------------------------------
     def render(self, counter):
@@ -93,8 +103,18 @@ class CounterModel:
             if parent == counter:
                 self.values[child] = 0
 
-    def name_for(self, counter):
-        return self.crefnames.get(counter) or DEFAULT_CREFNAMES.get(counter)
+    def name_for(self, counter, plural=False):
+        if plural:
+            name = self.crefnames_plural.get(counter)
+            if name:
+                return name
+            default = DEFAULT_CREFNAMES.get(counter)
+            return default[1] if default else None
+        name = self.crefnames.get(counter)
+        if name:
+            return name
+        default = DEFAULT_CREFNAMES.get(counter)
+        return default[0] if default else None
 
 
 # ---------------------------------------------------------------------------
@@ -170,13 +190,23 @@ def scan_preamble(src):
         model.formats[m.group(1)] = _parse_the_body(m.group(2), model)
 
     # \crefname{appx}{Appendix}{Appendices}
-    for m in re.finditer(r"\\[Cc]refname\s*\{([a-zA-Z@]+)\}\s*\{([^}]*)\}",
-                         preamble):
+    for m in re.finditer(r"\\[Cc]refname\s*\{([a-zA-Z@]+)\}\s*\{([^}]*)\}"
+                         r"\s*(?:\{([^}]*)\})?", preamble):
         name = m.group(2).strip()
-        # keep the capitalised form if both \crefname and \Crefname are given
         model.crefnames.setdefault(m.group(1), name)
         if name[:1].isupper():
             model.crefnames[m.group(1)] = name
+        if m.group(3):
+            plural = m.group(3).strip()
+            model.crefnames_plural.setdefault(m.group(1), plural)
+            if plural[:1].isupper():
+                model.crefnames_plural[m.group(1)] = plural
+
+    # cleveref's "capitalise" option makes \cref behave like \Cref
+    for m in re.finditer(r"\\usepackage\s*\[([^\]]*)\]\s*\{cleveref\}",
+                         preamble):
+        if re.search(r"\bcapitali[sz]e\b", m.group(1)):
+            model.capitalise = True
 
     # \newcommand{\appsection}[1]{ ... \refstepcounter{appx} ... }
     for m in re.finditer(r"\\(?:re|provide)?newcommand\s*\*?\s*\{?\\([a-zA-Z@]+)\}?"
@@ -259,18 +289,19 @@ def build_label_map(src, model=None):
         if m.group(1):                                   # sectioning
             counter = m.group(1)
             if m.group(2) == "*":                        # starred: unnumbered
-                pending = (model.name_for(counter), None)
+                pending = (model.name_for(counter), None, counter)
             else:
                 model.step(counter)
-                pending = (model.name_for(counter), model.render(counter))
+                pending = (model.name_for(counter), model.render(counter), counter)
         elif m.group(3):                                 # numbered environment
             env = m.group(3).rstrip("*")
             counter = "equation" if env in ("align", "equation") else env
             model.step(counter)
-            pending = (model.name_for(counter), model.render(counter))
+            pending = (model.name_for(counter), model.render(counter), counter)
         elif m.group(4) is not None:                     # \label{...}
             if pending is not None:
-                labels[m.group(4)] = pending
+                labels[m.group(4)] = pending[:2]
+                model.label_counter[m.group(4)] = pending[2]
                 pending = None
         elif m.group(5):                                 # \setcounter etc.
             op, counter, val = m.group(5), m.group(6), m.group(7)
@@ -289,7 +320,7 @@ def build_label_map(src, model=None):
             counter = model.macro_steps[m.group(m.lastindex)]
             model.step(counter)
             pending = (model.name_for(counter) or counter.title(),
-                       model.render(counter))
+                       model.render(counter), counter)
     return labels
 
 
@@ -471,4 +502,39 @@ def labels_from_aux(aux_text, model=None):
             or (ctype.title() if ctype else None)
         num = m.group("num").strip()
         out[m.group("label")] = (name, num or None)
+    return out
+
+
+def section_numbers(src, model=None):
+    """[(level, number_or_None), ...] for every sectioning command, in order.
+
+    LaTeX prints "2.2 Experiment 1: ...".  pandoc maps the heading to a Word
+    Heading style, which carries no number, so the Word file loses it -- and a
+    numbered heading sitting on a page boundary then reads as different text
+    on the two sides.  Starred sections are unnumbered and come back as None.
+    """
+    model = model or scan_preamble(src)
+    body = strip_comments(src).split("\\begin{document}", 1)[-1]
+    levels = {"section": 1, "subsection": 2, "subsubsection": 3}
+    pattern = re.compile(
+        r"\\(section|subsection|subsubsection)(\*?)\s*\{|"
+        r"\\(setcounter|addtocounter|stepcounter)\s*\{([a-zA-Z@]+)\}"
+        r"(?:\s*\{(-?\d+)\})?")
+    out = []
+    for m in pattern.finditer(body):
+        if m.group(1):
+            counter = m.group(1)
+            if m.group(2) == "*":
+                out.append((levels[counter], None))
+            else:
+                model.step(counter)
+                out.append((levels[counter], model.render(counter)))
+        elif m.group(3):
+            op, c, val = m.group(3), m.group(4), m.group(5)
+            if op == "stepcounter":
+                model.step(c)
+            elif val is not None:
+                cur = model.values.get(c, 0)
+                model.values[c] = (int(val) if op == "setcounter"
+                                   else cur + int(val))
     return out

@@ -123,44 +123,68 @@ right about its own numbering.
 - **Comments are stripped before preprocessing**, so nothing commented out is
   ever treated as content.
 
-## Page-faithful mode — status: measurably better, still not exact
+## Page-faithful mode
 
-Goal: every Word page starts and ends on the same word as the compiled LaTeX
-PDF, with one uniform text-block width for the whole document.
+Every Word page starts and ends on the same word as the compiled LaTeX PDF.
 
-Measured on the reference document (36-page LaTeX PDF, 14 floats, real
-bibliography): the plain conversion already produces **36 pages**, and 5 of
-them match the PDF exactly, with most of the rest lagging by a single page
-from the middle of the document onward. With page-fitting engaged the run
-lands at 40–41 pages and 6 exact matches — i.e. the machinery is not yet
-paying for itself, and the plain conversion is currently the better output.
+Measured on the reference document (36-page LaTeX PDF, 14 floats, 52-entry
+bibliography):
 
-What is solved:
+| | |
+|---|---|
+| pages | **36 / 36** |
+| page starts on exactly the right word | **34 / 36** |
+| source prose present in the output | **99.2%** |
+| uniform setting found | margins 0.90 in, figures 140 mm, leading 0.96, **12 pt unchanged** |
 
-- **`pdfprose.py`** extracts prose by filtering on the document's dominant
-  font and size (PyMuPDF), which cleanly separates 12 pt body text from the
-  5–8 pt labels drawn inside figures. Raw `pdftotext` mixes them and makes
-  every per-page word count wrong.
-- **Captions and table bodies are excluded** by matching the text taken from
-  the LaTeX source, not by guessing from vertical gaps. A table's body is
-  body-font text in the PDF but a detached float block in Word; leaving it in
-  skewed several pages badly.
-- **Running heads** are stripped even when the appendix renumbers to roman
-  numerals — otherwise no two headers share a shape, none reaches the
-  repetition threshold, and page numbers leak into the body word stream.
-- **Float placement**: each float's real page and top/bottom position is read
-  from the PDF and the Word block is moved there. All 14 place correctly.
-- **Float-only pages** (a full-page figure with no prose) no longer produce a
-  blank prose page *and* a figure page.
-- **Section breaks** inserted for appendix page numbering no longer stack with
-  an inserted break to leave a blank page.
+The two page starts that differ are the cover, whose title block has no
+single reading order, and one page where the PDF splits "6.0–6 M" into
+separate tokens.
 
-What is left: the fit still lands 4–5 pages long, and the loop tightens on the
-total page count rather than finding the first page that actually overflows —
-so it cannot tell which page needs the room. That per-page overflow
-measurement is the next piece.
+### How it works
 
-It is **not exposed in the UI**. The plain conversion is what the app ships.
+`pagebuild.py` treats each page as its own object -- `[float at top] + prose +
+[float at bottom]` -- renders it **on its own**, and asks whether it fits on a
+single page. Pages that do not fit are re-measured at successively wider text
+blocks, and the widest requirement across all 36 becomes one uniform setting
+for the whole document. Measuring 36 pages takes about 15 seconds, so the
+search is cheap; inferring overflow from the total page count, as the first
+attempt did, cannot tell you *which* page is too full.
+
+Supporting pieces, each of which was a real bug before it was a feature:
+
+- **`pdfprose.py`** — extracts the PDF's prose by filtering on the document's
+  dominant font and size, which separates 12 pt body text from the 5–8 pt
+  labels drawn inside figures. It also rejoins words LaTeX hyphenated at line
+  and page breaks ("build-" + "ing"), which alone accounted for most of an
+  apparent 10% shortfall, and orders words by line band rather than by raw
+  coordinate — a hyperlinked cross-reference renders with a slightly different
+  bounding box, and sorting on the raw value pulls every link out of its
+  sentence.
+- **`floats.py`** — reads each float's real page and top/bottom placement from
+  the PDF and moves the Word block there, because LaTeX floats figures and
+  Word does not. It also carries `\small` and friends across from inside float
+  environments; pandoc drops them, which on a dense table is several lines of
+  height.
+- **`pagefit.py`** — anchors each page by its own opening words rather than by
+  counting from the start of the document, so one small disagreement cannot
+  compound. Splits paragraphs on *inline children* — runs, hyperlinks, maths —
+  not just `<w:r>`, and hides the seam with last-line justification.
+- Figure width is fixed in millimetres rather than as a fraction of the text
+  width. Sizing figures relative to the text block is self-defeating: widening
+  the block to win vertical room makes every picture taller and gives back
+  more than it gained.
+
+### What it needs
+
+The compiled PDF, as ground truth for pagination, alongside the usual sources.
+Without it there is nothing to match against.
+
+### Known gaps
+
+Numbered section headings ("2.2 Experiment 1: …") arrive unnumbered, and a
+table caption is placed above its table rather than below. Neither affects
+pagination.
 
 ## Deploy free on Streamlit Community Cloud
 

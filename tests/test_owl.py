@@ -35,7 +35,8 @@ def test_appendix_cross_references_resolve():
 \appsection{Second}\label{app:two}
 \end{document}"""
     labels = build_label_map(src)
-    assert labels["sec:intro"] == ("Section", "1")
+    # cleveref's own default for a section is lower-case "section"
+    assert labels["sec:intro"] == ("section", "1")
     assert labels["app:one"] == ("Appendix", "A")
     assert labels["app:two"] == ("Appendix", "B")
 
@@ -60,14 +61,25 @@ def test_supplementary_figure_numbering():
 \end{document}"""
     figs, _ = float_numbers(src)
     assert figs == ["1", "2", "S1"]
-    assert build_label_map(src)["fig:si"] == ("Figure", "S1")
+    # cleveref abbreviates figures: \cref{fig:si} prints "fig. S1"
+    assert build_label_map(src)["fig:si"] == ("fig.", "S1")
+
+
+def test_cleveref_capitalise_option_is_detected():
+    r"""\usepackage[capitalise]{cleveref} makes \cref capitalise like \Cref."""
+    plain = PREAMBLE + r"\section{A}\label{s}\end{document}"
+    assert scan_preamble(plain).capitalise is False
+    caps = plain.replace("\\usepackage{graphicx}",
+                         "\\usepackage{graphicx}\n"
+                         "\\usepackage[capitalise]{cleveref}")
+    assert scan_preamble(caps).capitalise is True
 
 
 def test_equation_labels():
     src = PREAMBLE + r"""
 \begin{equation}\label{eq:one}E=mc^2\end{equation}
 \end{document}"""
-    assert build_label_map(src)["eq:one"] == ("Equation", "1")
+    assert build_label_map(src)["eq:one"] == ("eq.", "1")
 
 
 def test_stray_brace_is_reported_with_a_line_number():

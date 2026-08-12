@@ -242,5 +242,90 @@ def source_captions(tex_src):
         text = re.sub(r"\\[a-zA-Z]+\s*(?:\[[^\]]*\])?", " ", text)
         text = re.sub(r"[{}$~\\\\]", " ", text)
         words = re.findall(r"[0-9A-Za-z][0-9A-Za-z'-]*", text)
-        out.append((kind, words + extra))
+        # caption and body are kept apart: they sit on opposite sides of the
+        # float in the PDF, and matching them as one run lets a table full of
+        # ambiguous numbers keep "matching" into the heading that follows
+        out.append((kind, words, extra))
     return out
+
+
+# ---------------------------------------------------------------------------
+# font-size declarations inside floats
+# ---------------------------------------------------------------------------
+
+# LaTeX's size steps, in points, for the three standard base sizes
+SIZE_TABLE = {
+    10: {"tiny": 5, "scriptsize": 7, "footnotesize": 8, "small": 9,
+         "normalsize": 10, "large": 12, "Large": 14, "LARGE": 17,
+         "huge": 20, "Huge": 25},
+    11: {"tiny": 6, "scriptsize": 8, "footnotesize": 9, "small": 10,
+         "normalsize": 11, "large": 12, "Large": 14, "LARGE": 17,
+         "huge": 20, "Huge": 25},
+    12: {"tiny": 6, "scriptsize": 8, "footnotesize": 10, "small": 11,
+         "normalsize": 12, "large": 14, "Large": 17, "LARGE": 20,
+         "huge": 25, "Huge": 25},
+}
+
+
+def base_font_size(tex_src):
+    m = re.search(r"\\documentclass\s*\[([^\]]*)\]", tex_src)
+    if m:
+        for opt in m.group(1).split(","):
+            o = opt.strip()
+            if o.endswith("pt") and o[:-2].isdigit():
+                return int(o[:-2])
+    return 10
+
+
+def source_float_sizes(tex_src):
+    """[(kind, points_or_None), ...] for every float, in document order.
+
+    A table set with `\\small` is 11 pt in a 12 pt document.  pandoc drops the
+    declaration, so Word renders the table a full point larger than the
+    original -- which on a dense table is several extra lines of height and
+    can be the difference between a page fitting and not.  Carrying the size
+    across is fidelity, not a tweak.
+    """
+    from .counters import strip_comments
+    src = strip_comments(tex_src)
+    body = src.split("\\begin{document}", 1)[-1]
+    base = base_font_size(tex_src)
+    steps = SIZE_TABLE.get(base, SIZE_TABLE[10])
+    out = []
+    for m in re.finditer(r"\\begin\{(figure|table)\}\*?", body):
+        kind = "Figure" if m.group(1) == "figure" else "Table"
+        end = body.find("\\end{" + m.group(1) + "}", m.end())
+        chunk = body[m.end():end if end != -1 else len(body)]
+        found = None
+        for name in ("tiny", "scriptsize", "footnotesize", "small",
+                     "normalsize", "large", "Large", "LARGE", "huge", "Huge"):
+            if re.search(r"\\" + name + r"\b", chunk):
+                found = steps[name]
+                break
+        out.append((kind, found))
+    return out
+
+
+def apply_float_sizes(doc, blocks, sizes):
+    """Set each float block's font size from the LaTeX declaration."""
+    from docx.oxml import OxmlElement
+    from docx.shared import Pt
+    applied = 0
+    for (kind, num, group), (_k, pt) in zip(blocks, sizes):
+        if not pt:
+            continue
+        half = str(int(round(pt * 2)))
+        for el in group:
+            for r in el.iter(qn("w:r")):
+                rPr = r.find(qn("w:rPr"))
+                if rPr is None:
+                    rPr = OxmlElement("w:rPr")
+                    r.insert(0, rPr)
+                for tag in ("w:sz", "w:szCs"):
+                    for old in rPr.findall(qn(tag)):
+                        rPr.remove(old)
+                    el2 = OxmlElement(tag)
+                    el2.set(qn("w:val"), half)
+                    rPr.append(el2)
+        applied += 1
+    return applied

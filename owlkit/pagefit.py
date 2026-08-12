@@ -151,53 +151,117 @@ def docx_word_stream(doc):
     """
     words, sites = [], []
     for para in _iter_body_paragraphs(doc):
-        for run in para.runs:
-            text = run.text
-            if not text:
-                continue
-            for m in re.finditer(r"\S+", text):
-                w = normalise(m.group(0))
-                if w:
-                    words.append(w)
-                    sites.append((para, run, m.start()))
+        # Walk the paragraph in document order, including runs wrapped in a
+        # <w:hyperlink> and the text inside <m:oMath>.
+        #
+        # python-docx's .runs returns only direct <w:r> children, which drops
+        # every cross-reference; and maths lives in <m:t>, not <w:t>.  Both are
+        # present in the PDF's text, so leaving either out of this stream makes
+        # the two sides disagree on how many words a page holds and drags every
+        # later boundary out of place.  Maths is included for alignment but
+        # marked unsplittable -- a page must never break inside an equation.
+        for node in para._p.iter():
+            if node.tag == qn("w:r"):
+                if _in_math(node):
+                    continue
+                text = "".join(t.text or "" for t in node.findall(qn("w:t")))
+                if not text:
+                    continue
+                for m in re.finditer(r"\S+", text):
+                    w = normalise(m.group(0))
+                    if w:
+                        words.append(w)
+                        sites.append((para, node, m.start()))
+            elif node.tag == qn("m:oMath"):
+                text = "".join(t.text or "" for t in node.iter(qn("m:t")))
+                for m in re.finditer(r"\S+", text):
+                    w = normalise(m.group(0))
+                    if w:
+                        words.append(w)
+                        sites.append((para, None, None))     # unsplittable
     return words, sites
+
+
+def _in_math(el):
+    parent = el.getparent()
+    while parent is not None:
+        if parent.tag in (qn("m:oMath"), qn("m:oMathPara")):
+            return True
+        parent = parent.getparent()
+    return False
 
 
 # ---------------------------------------------------------------------------
 # alignment
 # ---------------------------------------------------------------------------
 
-def align_boundaries(pdf_words, page_counts, docx_words):
+def align_boundaries(pdf_words, page_counts, docx_words, anchor=10):
     """Map each PDF page boundary onto an index in the Word word stream.
 
-    The two streams are never identical -- equations, captions and table cells
-    serialise differently -- so this uses a longest-matching-block alignment
-    and, for each boundary, takes the nearest reliable anchor.
+    Each page is located by its own **opening words**, not by counting words
+    from the start of the document.  Cumulative counting compounds every small
+    disagreement between the two streams -- a symbol the PDF renders as text
+    and Word keeps as an equation, a ligature, a hyphenated word -- so by the
+    middle of a long document the boundary can be twenty words out even though
+    every page individually is fine.  Searching for the page's first words
+    makes each boundary independent of every other one.
+
+    A global difflib alignment still runs first, to give each search a
+    neighbourhood to look in and to catch pages whose opening words repeat
+    elsewhere.
     """
     matcher = difflib.SequenceMatcher(None, pdf_words, docx_words, autojunk=False)
-    blocks = matcher.get_matching_blocks()
+    blocks = [b for b in matcher.get_matching_blocks() if b.size]
 
-    boundaries = []
-    cum = 0
+    boundaries, cum = [], 0
     for count in page_counts[:-1]:          # no break after the final page
         cum += count
         boundaries.append(cum)
 
+    def rough(b):
+        """Where difflib thinks this position lands, interpolating gaps."""
+        prev_end_a = prev_end_b = 0
+        for a, bx, size in blocks:
+            if a <= b <= a + size:
+                return bx + (b - a)
+            if a > b:                       # b sits in the gap before this block
+                span_a = a - prev_end_a
+                if span_a <= 0:
+                    return prev_end_b
+                frac = (b - prev_end_a) / span_a
+                return int(prev_end_b + frac * (bx - prev_end_b))
+            prev_end_a, prev_end_b = a + size, bx + size
+        return prev_end_b
+
     mapped = []
     for b in boundaries:
-        best = None
-        for a, bx, size in blocks:
-            if size == 0:
-                continue
-            if a <= b <= a + size:                       # inside a matched run
-                best = bx + (b - a)
-                break
-            # otherwise remember the closest block that ends before b
-            if a + size <= b:
-                cand = bx + size
-                if best is None or cand > best:
-                    best = cand
+        guess = rough(b)
+        probe = [w for w in pdf_words[b:b + anchor] if w]
+        best = guess
+        if probe:
+            window = 300
+            lo = max(0, guess - window)
+            hi = min(len(docx_words), guess + window)
+            best_score, best_pos = 0, None
+            for k in range(lo, hi):
+                score = 0
+                for t in range(len(probe)):
+                    if k + t < len(docx_words) and docx_words[k + t] == probe[t]:
+                        score += 1
+                    else:
+                        break
+                if score > best_score:
+                    best_score, best_pos = score, k
+                    if score == len(probe):
+                        break
+            if best_pos is not None and best_score >= min(3, len(probe)):
+                best = best_pos
         mapped.append(best)
+
+    # boundaries must never run backwards
+    for k in range(1, len(mapped)):
+        if mapped[k] is not None and mapped[k - 1] is not None:
+            mapped[k] = max(mapped[k], mapped[k - 1])
     return mapped
 
 
@@ -243,213 +307,110 @@ def _set_page_break_before(p_el, on=True):
 
 
 def split_paragraph_at(para, run, offset):
-    """Split `para` so that everything from `offset` in `run` onwards lives in
-    a new paragraph immediately after it.  Returns the new paragraph element.
+    """Split `para` so everything from `offset` onward lives in a new
+    paragraph immediately after it.  Returns the new paragraph element.
+
+    The split walks the paragraph's *inline children* -- runs, hyperlinks,
+    maths, bookmarks -- not just its direct <w:r> children.  Splitting on runs
+    alone leaves every <w:hyperlink> in both halves, which duplicates each
+    cross-reference and drops it at the wrong end of the page.
 
     The visual seam is hidden: the first half gets last-line justification so
-    its final line still reaches the right margin like a mid-paragraph line
-    would, and the second half loses its first-line indent and space-before so
-    it reads as a continuation rather than a new paragraph.
+    its final line still reaches the right margin, and the second half loses
+    its first-line indent and space-before so it reads as a continuation.
     """
-    p_el = para._p
+    p_el = para._p if hasattr(para, "_p") else para
+    r_el = run if not hasattr(run, "_r") else run._r
+
+    def inline_children(el):
+        return [c for c in el if c.tag not in (qn("w:pPr"),)]
+
+    # which inline child holds this run?
+    children = inline_children(p_el)
+    holder_idx = None
+    for k, ch in enumerate(children):
+        if ch is r_el or r_el in list(ch.iter()):
+            holder_idx = k
+            break
+    if holder_idx is None:
+        holder_idx = 0
+
     tail_el = copy.deepcopy(p_el)
+    tail_children = inline_children(tail_el)
 
-    runs = list(p_el.findall(qn("w:r")))
-    tail_runs = list(tail_el.findall(qn("w:r")))
-    try:
-        pos = runs.index(run._r)
-    except ValueError:
-        pos = 0
-
+    # split the text of the run itself
     if offset:
-        text = run.text
-        run.text = text[:offset]
-        for t in tail_runs[pos].findall(qn("w:t")):
-            tail_runs[pos].remove(t)
-        t = tail_runs[pos].makeelement(qn("w:t"), {})
-        t.text = text[offset:]
-        t.set(qn("xml:space"), "preserve")
-        tail_runs[pos].append(t)
-        keep_from = pos
+        ts = r_el.findall(qn("w:t"))
+        text = "".join(t.text or "" for t in ts)
+        head_text, tail_text = text[:offset], text[offset:]
+        for t in ts[1:]:
+            r_el.remove(t)
+        if ts:
+            ts[0].text = head_text
+            ts[0].set(qn("xml:space"), "preserve")
+        # the same run inside the copied paragraph keeps the remainder
+        twin = None
+        for cand in tail_children[holder_idx].iter(qn("w:r")):
+            twin = cand
+            if cand.tag == qn("w:r"):
+                # match by position among runs in that child
+                pass
+        holder = tail_children[holder_idx]
+        runs_in_holder = list(holder.iter(qn("w:r")))
+        orig_runs = list(children[holder_idx].iter(qn("w:r")))
+        try:
+            pos = orig_runs.index(r_el)
+        except ValueError:
+            pos = 0
+        if pos < len(runs_in_holder):
+            twin = runs_in_holder[pos]
+            tts = twin.findall(qn("w:t"))
+            for t in tts[1:]:
+                twin.remove(t)
+            if tts:
+                tts[0].text = tail_text
+                tts[0].set(qn("xml:space"), "preserve")
+            # anything before this run inside the same child goes to the head
+            for earlier in runs_in_holder[:pos]:
+                parent = earlier.getparent()
+                if parent is not None:
+                    parent.remove(earlier)
+        # the tail KEEPS the child that was split -- it holds the remainder of
+        # the text -- while the head drops everything after it
+        keep_from = holder_idx
+        drop_head_from = holder_idx + 1
     else:
-        keep_from = pos
+        keep_from = holder_idx
+        drop_head_from = holder_idx
 
-    # head keeps runs [0, keep_from) plus the truncated one
-    for r in runs[keep_from + (1 if offset else 0):]:
-        p_el.remove(r)
-    # tail keeps runs [keep_from, end)
-    for r in tail_runs[:keep_from]:
-        tail_el.remove(r)
+    for ch in children[drop_head_from:]:
+        p_el.remove(ch)
+    for ch in tail_children[:keep_from]:
+        tail_el.remove(ch)
 
-    # hide the seam
-    head_pPr = _pPr(p_el)
-    jc = head_pPr.find(qn("w:jc"))
-    if jc is None:
-        jc = head_pPr.makeelement(qn("w:jc"), {})
-        head_pPr.append(jc)
-    if jc.get(qn("w:val")) in (None, "both", "justify"):
-        jc.set(qn("w:val"), "distribute")     # justify the final line too
+    # Justify the head's final line so the seam is invisible -- but only when
+    # the head actually keeps some text.  Stretching an empty or one-word
+    # remnant across the measure is worse than the seam it hides.
+    head_text = "".join(t.text or "" for t in p_el.iter(qn("w:t")))
+    if len(head_text.split()) >= 6:
+        head_pPr = _pPr(p_el)
+        jc = head_pPr.find(qn("w:jc"))
+        if jc is None:
+            jc = head_pPr.makeelement(qn("w:jc"), {})
+            head_pPr.append(jc)
+        if jc.get(qn("w:val")) in (None, "both", "justify"):
+            jc.set(qn("w:val"), "distribute")
 
     tail_pPr = _pPr(tail_el)
-    for tag in ("w:ind", "w:spacing"):
-        el = tail_pPr.find(qn(tag))
-        if el is not None:
-            el.set(qn("w:firstLine"), "0") if tag == "w:ind" else None
-            if tag == "w:spacing":
-                el.set(qn("w:before"), "0")
+    ind = tail_pPr.find(qn("w:ind"))
+    if ind is not None:
+        ind.set(qn("w:firstLine"), "0")
+    spacing = tail_pPr.find(qn("w:spacing"))
+    if spacing is not None:
+        spacing.set(qn("w:before"), "0")
 
     p_el.addnext(tail_el)
     return tail_el
-
-
-# ---------------------------------------------------------------------------
-# uniform density controls
-# ---------------------------------------------------------------------------
-
-class Density:
-    """One uniform setting for the whole document."""
-
-    def __init__(self, margin_in=1.0, line_spacing=1.0, font_delta=0.0,
-                 figure_scale=1.0):
-        self.margin_in = margin_in
-        self.line_spacing = line_spacing
-        self.font_delta = font_delta        # points added to the base size
-        self.figure_scale = figure_scale
-
-    def __repr__(self):
-        return (f"margins={self.margin_in:.2f}in spacing={self.line_spacing:.3f} "
-                f"font{self.font_delta:+.1f}pt figures={self.figure_scale:.2f}")
-
-
-def apply_density(doc, d):
-    """Apply a Density uniformly: page margins, line spacing, font size and
-    figure scale."""
-    twips = int(d.margin_in * 1440)
-    for section in doc.sections:
-        section.left_margin = Twips(twips)
-        section.right_margin = Twips(twips)
-        section.top_margin = Twips(twips)
-        section.bottom_margin = Twips(twips)
-
-    if d.line_spacing != 1.0 or d.font_delta:
-        style = doc.styles["Normal"]
-        if d.font_delta and style.font.size is not None:
-            style.font.size = Pt(style.font.size.pt + d.font_delta)
-        elif d.font_delta:
-            style.font.size = Pt(12 + d.font_delta)
-        pf = style.paragraph_format
-        pf.line_spacing = d.line_spacing
-
-    if d.figure_scale != 1.0:
-        for shape in doc.inline_shapes:
-            shape.width = int(shape.width * d.figure_scale)
-            shape.height = int(shape.height * d.figure_scale)
-
-
-# ---------------------------------------------------------------------------
-# measuring
-# ---------------------------------------------------------------------------
-
-def render_pdf(docx_path, outdir=None):
-    """Render a .docx to PDF with LibreOffice, for measurement only."""
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
-    if not soffice:
-        raise RuntimeError("LibreOffice is required to measure page fit")
-    outdir = outdir or os.path.dirname(os.path.abspath(docx_path))
-    subprocess.run([soffice, "--headless", "--convert-to", "pdf",
-                    "--outdir", outdir, docx_path],
-                   capture_output=True, timeout=600)
-    out = os.path.join(outdir,
-                       os.path.splitext(os.path.basename(docx_path))[0] + ".pdf")
-    if not os.path.exists(out):
-        raise RuntimeError("LibreOffice produced no PDF")
-    return out
-
-
-def page_count(pdf_path):
-    out = subprocess.run(["pdfinfo", pdf_path], capture_output=True, text=True)
-    m = re.search(r"^Pages:\s+(\d+)", out.stdout, re.M)
-    return int(m.group(1)) if m else 0
-
-
-class PageCheck:
-    """The verification for one page: does it start and end on the same word
-    as the LaTeX PDF, and does it hold the same amount of prose?"""
-
-    def __init__(self, page, first_ok, last_ok, target_n, got_n,
-                 target_first, got_first, target_last, got_last):
-        self.page = page
-        self.first_ok = first_ok
-        self.last_ok = last_ok
-        self.target_n = target_n
-        self.got_n = got_n
-        self.target_first = target_first
-        self.got_first = got_first
-        self.target_last = target_last
-        self.got_last = got_last
-
-    @property
-    def ok(self):
-        return self.first_ok and self.last_ok
-
-    def describe(self):
-        if self.ok:
-            return f"page {self.page}: ok ({self.got_n} words)"
-        bits = []
-        if not self.first_ok:
-            bits.append(f"starts {self.got_first!r}, expected {self.target_first!r}")
-        if not self.last_ok:
-            bits.append(f"ends {self.got_last!r}, expected {self.target_last!r}")
-        return f"page {self.page}: " + "; ".join(bits)
-
-
-def verify(target_pdf, produced_pdf, placements=None, captions=None, sample=4):
-    """Compare the produced PDF against the LaTeX PDF page by page.
-
-    Both sides go through the same prose extractor, so figure internals and
-    captions are excluded from both and the comparison is like for like.
-    """
-    tgt = pdfprose.strip_running_heads(
-        pdfprose.prose_pages(target_pdf, placements, captions))
-    got = pdfprose.strip_running_heads(
-        pdfprose.prose_pages(produced_pdf, placements, captions))
-
-    checks = []
-    for i in range(max(len(tgt), len(got))):
-        t = [w for w in (normalise(x) for x in (tgt[i] if i < len(tgt) else [])) if w]
-        g = [w for w in (normalise(x) for x in (got[i] if i < len(got) else [])) if w]
-        tf, gf = " ".join(t[:sample]), " ".join(g[:sample])
-        tl, gl = " ".join(t[-sample:]), " ".join(g[-sample:])
-        checks.append(PageCheck(i + 1, tf == gf, tl == gl, len(t), len(g),
-                                tf, gf, tl, gl))
-    return checks
-
-
-def image_count(docx_path):
-    from docx import Document
-    return len(Document(docx_path).inline_shapes)
-
-
-# ---------------------------------------------------------------------------
-# the fitting loop
-# ---------------------------------------------------------------------------
-
-def caption_index(tex_src):
-    """{(kind, printed_number): caption_words} for every float."""
-    from .counters import scan_preamble, float_numbers
-    model = scan_preamble(tex_src)
-    fig_nums, tab_nums = float_numbers(tex_src, model)
-    out, fi, ti = {}, 0, 0
-    for kind, words in floats.source_captions(tex_src):
-        if kind == "Figure":
-            if fi < len(fig_nums):
-                out[("Figure", fig_nums[fi])] = words
-            fi += 1
-        else:
-            if ti < len(tab_nums):
-                out[("Table", tab_nums[ti])] = words
-            ti += 1
-    return out
 
 
 def strip_existing_page_breaks(doc):
@@ -469,14 +430,8 @@ def strip_existing_page_breaks(doc):
 
 
 def section_break_paragraphs(doc):
-    """Paragraphs carrying an inline <w:sectPr>.
-
-    The postprocessor creates sections so the appendix can renumber its pages.
-    A section break is itself a page break, so if a ground-truth boundary lands
-    on the same spot and we also set pageBreakBefore, Word emits *two* breaks
-    and leaves a blank page -- which then cascades through every later
-    boundary.
-    """
+    """Paragraphs carrying an inline <w:sectPr>.  A section break of type
+    nextPage is itself a page break."""
     out = []
     for p in doc.element.body.findall(qn("w:p")):
         pPr = p.find(qn("w:pPr"))
@@ -525,15 +480,48 @@ def apply_boundaries(doc, sites, indices, prose_pages=None):
             continue
         if prose_pages is not None and not prose_pages.get(page_no, True):
             continue
+        # never break inside an equation: walk on to the next real run
+        while idx < len(sites) and sites[idx][1] is None:
+            idx += 1
+        if idx >= len(sites):
+            continue
         ordered.append((page_no, idx))
 
     # back to front: splitting a later paragraph cannot disturb earlier sites
     for page_no, idx in sorted(ordered, key=lambda t: t[1], reverse=True):
         para, run, offset = sites[idx]
+
+        # A heading is atomic.  Splitting one leaves "2.2 Experiment" at the
+        # foot of a page and "1: chaotropic softening..." at the head of the
+        # next -- and the justification that hides an ordinary mid-sentence
+        # split stretches the orphaned half across the full measure.  LaTeX
+        # never breaks there either: it pushes the whole heading over.
+        if _is_heading(para):
+            first = _first_run(para)
+            if first is not None:
+                run, offset = first, 0
+
         tail = split_paragraph_at(para, run, offset)
         _set_page_break_before(tail, True)
         starts[page_no] = tail
     return starts
+
+
+def _is_heading(para):
+    try:
+        name = (para.style.name if para.style else "") or ""
+    except Exception:
+        return False
+    name = name.strip().lower()
+    return name.startswith("heading") or name in ("title", "subtitle")
+
+
+def _first_run(para):
+    p_el = para._p if hasattr(para, "_p") else para
+    for r in p_el.iter(qn("w:r")):
+        if "".join(t.text or "" for t in r.findall(qn("w:t"))):
+            return r
+    return None
 
 
 def build_candidate(docx_path, pdf_words, counts, placements, density):
@@ -670,3 +658,327 @@ def fit(docx_path, target_pdf, tex_src, out_path, log=print, max_rounds=10,
             "checks": checks, "verified": good, "render": rendered,
             "orphaned": orphaned, "images": imgs,
             "images_expected": n_images_before}
+
+
+# ---------------------------------------------------------------------------
+# uniform density controls
+# ---------------------------------------------------------------------------
+
+class Density:
+    """One uniform setting for the whole document."""
+
+    def __init__(self, margin_in=1.0, line_spacing=1.0, font_delta=0.0,
+                 figure_scale=1.0, image_width_mm=None, compact_tables=True):
+        self.margin_in = margin_in
+        self.line_spacing = line_spacing
+        self.font_delta = font_delta        # points added to the base size
+        self.figure_scale = figure_scale
+        # A fixed image width decouples figure height from the text block.
+        # Sizing images as a fraction of text width is self-defeating here:
+        # widening the block to win vertical room makes every picture taller
+        # and takes more room away than it gained.
+        self.image_width_mm = image_width_mm
+        self.compact_tables = compact_tables
+
+    def __repr__(self):
+        img = (f"images={self.image_width_mm:.0f}mm" if self.image_width_mm
+               else f"figures={self.figure_scale:.2f}")
+        return (f"margins={self.margin_in:.2f}in spacing={self.line_spacing:.3f} "
+                f"font{self.font_delta:+.1f}pt {img}")
+
+
+def apply_density(doc, d):
+    """Apply a Density uniformly."""
+    twips = int(d.margin_in * 1440)
+    for section in doc.sections:
+        section.left_margin = Twips(twips)
+        section.right_margin = Twips(twips)
+        section.top_margin = Twips(twips)
+        section.bottom_margin = Twips(twips)
+
+    if d.line_spacing != 1.0 or d.font_delta:
+        _retune_styles(doc, d)
+
+    # NB: a fixed image width is applied later, per float, in pagebuild --
+    # applying it here would also hit inline images that are not figures at
+    # all, such as a crest on the title page sized in absolute units.
+    if d.figure_scale != 1.0:
+        for i in range(len(doc.inline_shapes)):
+            shape = doc.inline_shapes[i]
+            shape.width = int(shape.width * d.figure_scale)
+            shape.height = int(shape.height * d.figure_scale)
+
+    if d.compact_tables:
+        compact_tables(doc)
+
+
+def _retune_styles(doc, d):
+    """Apply the size and leading change to *every* style, not just Normal.
+
+    pandoc's output uses its own paragraph styles (BodyText, FirstParagraph,
+    Compact, ...) and those carry their own explicit sizes.  Changing only
+    Normal therefore changes nothing on screen -- which is exactly why earlier
+    tightening rounds produced identical renders at different settings.
+    """
+    from docx.oxml import OxmlElement
+
+    def set_size(rPr, pt):
+        half = str(int(round(pt * 2)))
+        for tag in ("w:sz", "w:szCs"):
+            for old in rPr.findall(qn(tag)):
+                rPr.remove(old)
+            el = OxmlElement(tag)
+            el.set(qn("w:val"), half)
+            rPr.append(el)
+
+    def set_spacing(pPr, mult):
+        for old in pPr.findall(qn("w:spacing")):
+            line = old.get(qn("w:line"))
+            if line:
+                old.set(qn("w:line"), str(max(120, int(int(line) * mult))))
+                old.set(qn("w:lineRule"), "auto")
+                return
+            pPr.remove(old)
+        el = OxmlElement("w:spacing")
+        el.set(qn("w:line"), str(int(240 * mult)))
+        el.set(qn("w:lineRule"), "auto")
+        pPr.append(el)
+
+    styles_el = doc.styles.element
+    for defaults in styles_el.findall(qn("w:docDefaults")):
+        for rPrDef in defaults.findall(qn("w:rPrDefault")):
+            rPr = rPrDef.find(qn("w:rPr"))
+            if rPr is None:
+                rPr = OxmlElement("w:rPr")
+                rPrDef.append(rPr)
+            cur = rPr.find(qn("w:sz"))
+            base = int(cur.get(qn("w:val"))) / 2 if cur is not None else 12.0
+            if d.font_delta:
+                set_size(rPr, base + d.font_delta)
+        for pPrDef in defaults.findall(qn("w:pPrDefault")):
+            pPr = pPrDef.find(qn("w:pPr"))
+            if pPr is None:
+                pPr = OxmlElement("w:pPr")
+                pPrDef.append(pPr)
+            if d.line_spacing != 1.0:
+                set_spacing(pPr, d.line_spacing)
+
+    for style in styles_el.findall(qn("w:style")):
+        rPr = style.find(qn("w:rPr"))
+        if rPr is not None and d.font_delta:
+            cur = rPr.find(qn("w:sz"))
+            if cur is not None:
+                set_size(rPr, int(cur.get(qn("w:val"))) / 2 + d.font_delta)
+        pPr = style.find(qn("w:pPr"))
+        if d.line_spacing != 1.0:
+            if pPr is None:
+                pPr = OxmlElement("w:pPr")
+                style.insert(0, pPr)
+            set_spacing(pPr, d.line_spacing)
+
+    if d.font_delta:
+        for rPr in doc.element.body.iter(qn("w:rPr")):
+            cur = rPr.find(qn("w:sz"))
+            if cur is not None:
+                set_size(rPr, int(cur.get(qn("w:val"))) / 2 + d.font_delta)
+
+
+def compact_tables(doc, text_width_emu=None):
+    """Give table columns the width their contents actually need.
+
+    pandoc derives fixed column widths from the LaTeX column spec and they come
+    out consistently too narrow: a cell like "ACC TAC AC" that is one line in
+    the original wraps onto two, so an eight-row table renders sixteen rows
+    tall.  Font size and cell padding are left exactly as they are -- this only
+    stops Word wrapping text the original never wrapped.
+    """
+    from docx.oxml import OxmlElement
+
+    if text_width_emu is None:
+        sec = doc.sections[0]
+        text_width_emu = ((sec.page_width or 7772400)
+                          - (sec.left_margin or 914400)
+                          - (sec.right_margin or 914400))
+    total_twips = int(text_width_emu / 914400 * 1440)
+
+    for table in doc.tables:
+        rows = table.rows
+        if not rows:
+            continue
+        n_cols = len(rows[0].cells)
+        need = [1] * n_cols
+        for row in rows:
+            cells = row.cells
+            for k in range(min(n_cols, len(cells))):
+                text = cells[k].text.strip()
+                if not text:
+                    continue
+                longest = max((len(w) for w in text.split()), default=1)
+                need[k] = max(need[k], longest, min(len(text), longest + 6))
+        span = sum(need) or 1
+        widths = [max(600, int(total_twips * n / span)) for n in need]
+        over = sum(widths) - total_twips
+        if over > 0:
+            widths = [max(600, w - int(over * w / sum(widths))) for w in widths]
+
+        tblPr = table._tbl.tblPr
+        for tag in ("w:tblLayout", "w:tblW"):
+            for old in tblPr.findall(qn(tag)):
+                tblPr.remove(old)
+        layout = OxmlElement("w:tblLayout")
+        layout.set(qn("w:type"), "fixed")
+        tblPr.append(layout)
+        tw = OxmlElement("w:tblW")
+        tw.set(qn("w:w"), str(sum(widths)))
+        tw.set(qn("w:type"), "dxa")
+        tblPr.append(tw)
+
+        grid = table._tbl.find(qn("w:tblGrid"))
+        if grid is not None:
+            for gc, wdt in zip(grid.findall(qn("w:gridCol")), widths):
+                gc.set(qn("w:w"), str(wdt))
+        for row in rows:
+            cells = row.cells
+            for k in range(min(n_cols, len(cells))):
+                tcPr = cells[k]._tc.get_or_add_tcPr()
+                for old in tcPr.findall(qn("w:tcW")):
+                    tcPr.remove(old)
+                el = OxmlElement("w:tcW")
+                el.set(qn("w:w"), str(widths[k]))
+                el.set(qn("w:type"), "dxa")
+                tcPr.append(el)
+
+
+def set_float_image_width(blocks, mm, max_height_mm=None):
+    """Give every *figure* the same fixed width, in millimetres.
+
+    Applied only to images belonging to a float block, so an inline crest or
+    logo keeps the absolute size the LaTeX asked for.
+
+    `max_height_mm` caps a tall figure: at a fixed width, a portrait graphic
+    can be taller than the text frame once its caption is added, and then no
+    amount of margin tuning will keep it on one page -- it simply spills and
+    drags a blank page after it.
+    """
+    target = int(mm * 36000)                    # 1 mm = 36000 EMU
+    cap = int(max_height_mm * 36000) if max_height_mm else None
+    changed = 0
+    for _, _, group in blocks:
+        for el in group:
+            for ext in el.iter(qn("wp:extent")):
+                cx, cy = int(ext.get("cx")), int(ext.get("cy"))
+                if not cx:
+                    continue
+                new_cx, new_cy = target, int(target * cy / cx)
+                if cap and new_cy > cap:
+                    new_cx = int(cap * cx / cy)
+                    new_cy = cap
+                ext.set("cx", str(new_cx))
+                ext.set("cy", str(new_cy))
+                for a_ext in el.iter(qn("a:ext")):
+                    a_ext.set("cx", str(new_cx))
+                    a_ext.set("cy", str(new_cy))
+                changed += 1
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# measuring
+# ---------------------------------------------------------------------------
+
+def render_pdf(docx_path, outdir=None):
+    """Render a .docx to PDF with LibreOffice, for measurement only."""
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        raise RuntimeError("LibreOffice is required to measure page fit")
+    outdir = outdir or os.path.dirname(os.path.abspath(docx_path))
+    subprocess.run([soffice, "--headless", "--convert-to", "pdf",
+                    "--outdir", outdir, docx_path],
+                   capture_output=True, timeout=900)
+    out = os.path.join(outdir,
+                       os.path.splitext(os.path.basename(docx_path))[0] + ".pdf")
+    if not os.path.exists(out):
+        raise RuntimeError("LibreOffice produced no PDF")
+    return out
+
+
+def page_count(pdf_path):
+    out = subprocess.run(["pdfinfo", pdf_path], capture_output=True, text=True)
+    m = re.search(r"^Pages:\s+(\d+)", out.stdout, re.M)
+    return int(m.group(1)) if m else 0
+
+
+class PageCheck:
+    """The verification for one page: does it start and end on the same word
+    as the LaTeX PDF, and does it hold the same amount of prose?"""
+
+    def __init__(self, page, first_ok, last_ok, target_n, got_n,
+                 target_first, got_first, target_last, got_last):
+        self.page = page
+        self.first_ok = first_ok
+        self.last_ok = last_ok
+        self.target_n = target_n
+        self.got_n = got_n
+        self.target_first = target_first
+        self.got_first = got_first
+        self.target_last = target_last
+        self.got_last = got_last
+
+    @property
+    def ok(self):
+        return self.first_ok and self.last_ok
+
+    def describe(self):
+        if self.ok:
+            return f"page {self.page}: ok ({self.got_n} words)"
+        bits = []
+        if not self.first_ok:
+            bits.append(f"starts {self.got_first!r}, expected {self.target_first!r}")
+        if not self.last_ok:
+            bits.append(f"ends {self.got_last!r}, expected {self.target_last!r}")
+        return f"page {self.page}: " + "; ".join(bits)
+
+
+def verify(target_pdf, produced_pdf, placements=None, captions=None, sample=4):
+    """Compare the produced PDF against the LaTeX PDF page by page.
+
+    Both sides go through the same prose extractor, so figure internals and
+    captions are excluded from both and the comparison is like for like.
+    """
+    tgt = pdfprose.strip_running_heads(
+        pdfprose.prose_pages(target_pdf, placements, captions))
+    got = pdfprose.strip_running_heads(
+        pdfprose.prose_pages(produced_pdf, placements, captions))
+
+    checks = []
+    for i in range(max(len(tgt), len(got))):
+        t = [w for w in (normalise(x) for x in (tgt[i] if i < len(tgt) else [])) if w]
+        g = [w for w in (normalise(x) for x in (got[i] if i < len(got) else [])) if w]
+        tf, gf = " ".join(t[:sample]), " ".join(g[:sample])
+        tl, gl = " ".join(t[-sample:]), " ".join(g[-sample:])
+        checks.append(PageCheck(i + 1, tf == gf, tl == gl, len(t), len(g),
+                                tf, gf, tl, gl))
+    return checks
+
+
+def image_count(docx_path):
+    from docx import Document as _Doc
+    return len(_Doc(docx_path).inline_shapes)
+
+
+def caption_index(tex_src):
+    """{(kind, printed_number): caption_words} for every float."""
+    from .counters import scan_preamble, float_numbers
+    model = scan_preamble(tex_src)
+    fig_nums, tab_nums = float_numbers(tex_src, model)
+    out, fi, ti = {}, 0, 0
+    for kind, words, body in floats.source_captions(tex_src):
+        if kind == "Figure":
+            if fi < len(fig_nums):
+                out[("Figure", fig_nums[fi])] = (words, body)
+            fi += 1
+        else:
+            if ti < len(tab_nums):
+                out[("Table", tab_nums[ti])] = (words, body)
+            ti += 1
+    return out

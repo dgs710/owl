@@ -294,7 +294,7 @@ def make_resolver(src, tex_dir):
     return resolve
 
 
-def preprocess(src, tex_dir, labels, keep_drafts):
+def preprocess(src, tex_dir, labels, keep_drafts, model=None):
     """Returns (preprocessed_source, img_widths)."""
     # 0) comments first: a commented-out \\includegraphics or \\appsection
     #    must not be counted as real content
@@ -338,22 +338,58 @@ def preprocess(src, tex_dir, labels, keep_drafts):
 
     # 3) cross-references: \cref / \Cref / \autoref / \ref  ->  clickable
     #    "Section 2" / "Figure 1" links (token now, real hyperlink in postprocess)
-    def xref(inner):
-        parts = [p.strip() for p in inner.split(",") if p.strip()]
-        names = []
-        for p in parts:
-            kind, num = labels.get(p, (None, None))
-            if kind and num:
-                names.append(XREF_A + p + XREF_S + f"{kind} {num}" + XREF_E)
-            elif kind:
-                names.append(kind)
-            else:
-                names.append(p)
-        if len(names) <= 1:
-            return names[0] if names else ""
-        return ", ".join(names[:-1]) + " and " + names[-1]
+    from .counters import PARENTHESISED, scan_preamble
+    _model = model or scan_preamble(src)
+
+    def _display(counter, num, capital):
+        """Render one reference the way cleveref would."""
+        if counter in PARENTHESISED:
+            num = f"({num})"
+        return num, capital
+
+    def make_xref(capital):
+        def xref(inner):
+            """cleveref collapses a multi-key reference: \\cref{app:a,app:b}
+            prints "Appendices I and J", not "Appendix I and Appendix J"."""
+            parts = [p.strip() for p in inner.split(",") if p.strip()]
+            resolved = []
+            for p in parts:
+                kind, num = labels.get(p, (None, None))
+                counter = _model.label_counter.get(p)
+                resolved.append((p, kind, num, counter))
+
+            counters = {c for _, k, n, c in resolved if k and n and c}
+            same = len(counters) == 1 and all(k and n for _, k, n, _c in resolved)
+
+            def cased(name):
+                if capital or _model.capitalise:
+                    return name[:1].upper() + name[1:]
+                return name
+
+            names = []
+            for p, kind, num, counter in resolved:
+                if kind and num:
+                    shown_num = f"({num})" if counter in PARENTHESISED else num
+                    text = shown_num if (same and len(resolved) > 1) \
+                        else f"{cased(kind)} {shown_num}"
+                    names.append(XREF_A + p + XREF_S + text + XREF_E)
+                elif kind:
+                    names.append(cased(kind))
+                else:
+                    names.append(p)
+
+            if len(names) <= 1:
+                return names[0] if names else ""
+            joined = ", ".join(names[:-1]) + " and " + names[-1]
+            if same:
+                counter = next(iter(counters))
+                plural = _model.name_for(counter, plural=True) or counter
+                return cased(plural) + " " + joined
+            return joined
+        return xref
+
     for mac in ("Cref", "cref", "autoref", "ref"):
-        src = replace_braced(src, mac, xref)
+        src = replace_braced(src, mac, make_xref(mac[0].isupper()))
 
     # 3b) section boundaries first (they carry a page-number-format change), then
     #     ordinary page breaks. Distinct sentinels so the post-processor can make

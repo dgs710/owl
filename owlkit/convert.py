@@ -12,7 +12,8 @@ import subprocess
 import sys
 
 from . import preflight
-from .counters import scan_preamble, build_label_map, float_numbers, labels_from_aux
+from .counters import (scan_preamble, build_label_map, float_numbers,
+                       labels_from_aux, section_numbers)
 from .engine import (find_bib, scan_floats, collect_referenced, preprocess,
                      postprocess_docx, ensure_csl, make_resolver, log)
 from .constants import REFERENCE_DOCX
@@ -107,7 +108,7 @@ def convert(tex_path, output=None, keep_drafts=False, strict=True,
     referenced = collect_referenced(src)
     # img_widths comes back from preprocess so it lines up with the images
     # pandoc actually emits, not with every \includegraphics in the source
-    pre, img_widths = preprocess(src, tex_dir, labels, keep_drafts)
+    pre, img_widths = preprocess(src, tex_dir, labels, keep_drafts, model)
     floats_info = (img_widths, fig_labels, tab_labels)
 
     pre_path = os.path.join(tex_dir, ".owl.pre.tex")
@@ -139,5 +140,57 @@ def convert(tex_path, output=None, keep_drafts=False, strict=True,
 
     postprocess_docx(out_path, header_title, floats_info, referenced,
                      numbering=(fig_nums, tab_nums))
+
+    # restore heading numbers and carry \small / \footnotesize declarations
+    # from inside float environments across -- pandoc drops both
+    try:
+        from docx import Document as _Doc
+        from . import floats as _floats
+        _d = _Doc(out_path)
+        _blocks = _floats.find_blocks(_d)
+        _sizes = _floats.source_float_sizes(src)
+        _changed = bool(_floats.apply_float_sizes(_d, _blocks, _sizes))
+        _changed |= bool(number_headings(_d, src))
+        if _changed:
+            _d.save(out_path)
+    except Exception as exc:                       # never fail the conversion
+        emit(f"note: could not apply float font sizes ({exc})")
     emit(f"done: {os.path.basename(out_path)}")
     return Result(out_path, warnings, bib, labels, lines)
+
+
+def number_headings(doc, tex_src):
+    """Put the section numbers back on the headings.
+
+    LaTeX prints "2.2 Experiment 1: ..."; pandoc maps the heading to a Word
+    Heading style, which carries no number of its own, so the number is simply
+    lost.  Beyond looking wrong, it makes a heading on a page boundary read as
+    different text on the two sides.
+    """
+    import re as _re
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    numbers = section_numbers(tex_src)
+    heads = []
+    for p in doc.paragraphs:
+        name = (p.style.name if p.style else "") or ""
+        m = _re.match(r"Heading\s*([1-6])$", name.strip())
+        if m:
+            heads.append((int(m.group(1)), p))
+
+    applied = 0
+    for (level, num), (h_level, para) in zip(numbers, heads):
+        if not num or level != h_level:
+            continue
+        if para.text.strip().startswith(num + " "):
+            continue
+        r = OxmlElement("w:r")
+        t = OxmlElement("w:t")
+        t.text = f"{num} "
+        t.set(qn("xml:space"), "preserve")
+        r.append(t)
+        pPr = para._p.find(qn("w:pPr"))
+        (pPr.addnext(r) if pPr is not None else para._p.insert(0, r))
+        applied += 1
+    return applied
