@@ -31,6 +31,8 @@ class ConversionError(Exception):
 
 
 class Result:
+    match = None            # page-matching report, when a PDF was supplied
+
     def __init__(self, docx_path, warnings, bib, labels, log_lines):
         self.docx_path = docx_path
         self.warnings = warnings
@@ -40,12 +42,20 @@ class Result:
 
 
 def convert(tex_path, output=None, keep_drafts=False, strict=True,
-            aux_path=None, on_log=None):
+            aux_path=None, on_log=None, match_pdf=None, on_progress=None):
     """LaTeX -> editable .docx.
 
     strict=True refuses to produce a file when preflight finds errors, which
     is the point: a document that silently loses its citations, or that pandoc
     mangles from a stray brace, is worse than a clear refusal.
+
+    `match_pdf` is the compiled PDF.  Given one, the pages of the .docx are
+    rebuilt to break exactly where that PDF's pages break.  It is required for
+    that: nothing in the .tex says where the page breaks fall -- they are the
+    output of a line-breaking algorithm run against the fonts and margins, and
+    only exist once the document has been compiled.
+
+    `on_progress(fraction, message)` is called throughout, for a progress bar.
     """
     lines = []
 
@@ -53,6 +63,10 @@ def convert(tex_path, output=None, keep_drafts=False, strict=True,
         lines.append(msg)
         if on_log:
             on_log(msg)
+
+    def progress(frac, msg):
+        if on_progress:
+            on_progress(max(0.0, min(1.0, frac)), msg)
 
     if not shutil.which("pandoc"):
         raise ConversionError(
@@ -128,7 +142,9 @@ def convert(tex_path, output=None, keep_drafts=False, strict=True,
         if csl:
             cmd += ["--csl", csl]
 
+    progress(0.05, "checking the LaTeX source")
     emit("running pandoc…")
+    progress(0.10, "converting with pandoc")
     proc = subprocess.run(cmd, capture_output=True, text=True)
     try:
         os.remove(pre_path)
@@ -138,6 +154,7 @@ def convert(tex_path, output=None, keep_drafts=False, strict=True,
         raise ConversionError("pandoc could not read the LaTeX source.",
                               detail=(proc.stderr or proc.stdout or "")[-3000:])
 
+    progress(0.20, "rebuilding figures, captions and cross-references")
     postprocess_docx(out_path, header_title, floats_info, referenced,
                      numbering=(fig_nums, tab_nums))
 
@@ -155,8 +172,28 @@ def convert(tex_path, output=None, keep_drafts=False, strict=True,
             _d.save(out_path)
     except Exception as exc:                       # never fail the conversion
         emit(f"note: could not apply float font sizes ({exc})")
+    match = None
+    if match_pdf:
+        if not os.path.exists(match_pdf):
+            raise ConversionError(f"no such PDF: {match_pdf}")
+        from .pagebuild import match_pages
+        emit("matching pages to the compiled PDF…")
+
+        def relay(frac, msg):
+            emit(msg)
+            progress(0.25 + 0.72 * frac, msg)
+
+        match = match_pages(out_path, match_pdf, src, out_path,
+                            on_progress=relay)
+        emit(f"pages: {match['pages']} (PDF has {match['target_pages']}); "
+             f"{match['exact_starts']}/{len(match['checks'])} start on the "
+             f"same word")
+
+    progress(1.0, "done")
     emit(f"done: {os.path.basename(out_path)}")
-    return Result(out_path, warnings, bib, labels, lines)
+    result = Result(out_path, warnings, bib, labels, lines)
+    result.match = match
+    return result
 
 
 def number_headings(doc, tex_src):

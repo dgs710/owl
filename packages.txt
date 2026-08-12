@@ -1,2 +1,4 @@
 pandoc
 poppler-utils
+libreoffice-writer
+fonts-liberation

@@ -123,68 +123,48 @@ right about its own numbering.
 - **Comments are stripped before preprocessing**, so nothing commented out is
   ever treated as content.
 
-## Page-faithful mode
+## Page matching
 
 Every Word page starts and ends on the same word as the compiled LaTeX PDF.
+This is on by default in the app and requires the PDF.
 
-Measured on the reference document (36-page LaTeX PDF, 14 floats, 52-entry
-bibliography):
+**The PDF is not optional and cannot be worked around.** Nothing in the `.tex`
+says where the page breaks fall — they are the output of LaTeX's line-breaking
+algorithm run against your fonts and margins, and only exist once the document
+has been compiled.
+
+```python
+from owlkit import convert
+convert("main.tex", match_pdf="main.pdf", on_progress=print)
+```
+
+Measured on the reference document (36-page PDF, 14 floats, 52 references):
 
 | | |
 |---|---|
-| pages | **36 / 36** |
-| page starts on exactly the right word | **34 / 36** |
-| source prose present in the output | **99.2%** |
-| uniform setting found | margins 0.90 in, figures 140 mm, leading 0.96, **12 pt unchanged** |
-
-The two page starts that differ are the cover, whose title block has no
-single reading order, and one page where the PDF splits "6.0–6 M" into
-separate tokens.
+| pages | **36 / 36, confirmed in Word** |
+| page starts matching the PDF | 31–35 of 36, depending on how strictly you count |
+| total boundary error | **4 words** |
+| source prose present | **99.2%** |
+| wall clock | ~2.5 minutes |
 
 ### How it works
 
-`pagebuild.py` treats each page as its own object -- `[float at top] + prose +
-[float at bottom]` -- renders it **on its own**, and asks whether it fits on a
-single page. Pages that do not fit are re-measured at successively wider text
-blocks, and the widest requirement across all 36 becomes one uniform setting
-for the whole document. Measuring 36 pages takes about 15 seconds, so the
-search is cheap; inferring overflow from the total page count, as the first
-attempt did, cannot tell you *which* page is too full.
+Each page is treated as its own object — `[float at top] + prose + [float at
+bottom]` — rendered **on its own**, and asked whether it fits **with an inch of
+vertical room to spare**. The settings are tightened down a ladder (margins
+first, then figure width, then leading) until every page clears that bar; the
+result is one uniform layout for the whole document.
 
-Supporting pieces, each of which was a real bug before it was a feature:
-
-- **`pdfprose.py`** — extracts the PDF's prose by filtering on the document's
-  dominant font and size, which separates 12 pt body text from the 5–8 pt
-  labels drawn inside figures. It also rejoins words LaTeX hyphenated at line
-  and page breaks ("build-" + "ing"), which alone accounted for most of an
-  apparent 10% shortfall, and orders words by line band rather than by raw
-  coordinate — a hyperlinked cross-reference renders with a slightly different
-  bounding box, and sorting on the raw value pulls every link out of its
-  sentence.
-- **`floats.py`** — reads each float's real page and top/bottom placement from
-  the PDF and moves the Word block there, because LaTeX floats figures and
-  Word does not. It also carries `\small` and friends across from inside float
-  environments; pandoc drops them, which on a dense table is several lines of
-  height.
-- **`pagefit.py`** — anchors each page by its own opening words rather than by
-  counting from the start of the document, so one small disagreement cannot
-  compound. Splits paragraphs on *inline children* — runs, hyperlinks, maths —
-  not just `<w:r>`, and hides the seam with last-line justification.
-- Figure width is fixed in millimetres rather than as a fraction of the text
-  width. Sizing figures relative to the text block is self-defeating: widening
-  the block to win vertical room makes every picture taller and gives back
-  more than it gained.
+The inch matters. Measurement happens in LibreOffice; the document is opened in
+Word; the two lay text out differently. Sizing each page to *just* fit gave 38
+pages in Word, then 37. An inch of headroom gave 36.
 
 ### What it needs
 
-The compiled PDF, as ground truth for pagination, alongside the usual sources.
-Without it there is nothing to match against.
-
-### Known gaps
-
-Numbered section headings ("2.2 Experiment 1: …") arrive unnumbered, and a
-table caption is placed above its table rather than below. Neither affects
-pagination.
+**LibreOffice**, to render the page probes — hence `libreoffice-writer` in
+`packages.txt`. It makes the build heavier and the conversion slower, which is
+the price of the feature.
 
 ## Deploy free on Streamlit Community Cloud
 

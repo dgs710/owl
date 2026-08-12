@@ -128,16 +128,26 @@ with st.expander("…or upload individual files instead"):
     up_figs = st.file_uploader("figures (png / jpg / pdf / eps)",
                                accept_multiple_files=True)
 
-up_pdf = st.file_uploader("Compiled PDF (optional — added to the bundle)",
-                          type=["pdf"])
+st.markdown("### 2 · Upload the compiled PDF  (required)")
+st.markdown(
+    '<p class="owl-note">Overleaf → <b>Menu → Download → PDF</b>. This is not '
+    'optional and cannot be worked around: <b>nothing in the .tex says where '
+    'the page breaks fall</b>. They are the result of LaTeX\'s line-breaking '
+    'run against your fonts and margins, so they only exist once the document '
+    'has been compiled. The PDF is what OWL matches the Word pages to.</p>',
+    unsafe_allow_html=True)
+up_pdf = st.file_uploader("Compiled PDF", type=["pdf"])
 
-st.markdown("### 2 · Convert")
+st.markdown("### 3 · Convert")
 st.markdown(
     '<p class="owl-note">Produces an <b>editable Word</b> document — Times New '
     'Roman, justified, title page, running header, real Word equations, '
-    'numbered figure and table captions, clickable cross-references, and a '
-    'static ACS reference list built from your <code>.bib</code> with live '
-    'DOI links.</p>', unsafe_allow_html=True)
+    'numbered headings, numbered figure and table captions, clickable '
+    'cross-references, and a static ACS reference list built from your '
+    '<code>.bib</code> with live DOI links — and its pages broken where your '
+    'PDF\'s pages break. Expect <b>two to four minutes</b>: matching the '
+    'pages means rendering every page on its own and checking it fits with '
+    'room to spare.</p>', unsafe_allow_html=True)
 
 strict = st.checkbox("Stop if the LaTeX has problems (recommended)", value=True,
                      help="Uncheck to convert anyway. Citations may be lost "
@@ -162,6 +172,12 @@ if st.button("Convert to Word →", type="primary"):
             st.warning("Please upload your Overleaf .zip (or at least a .tex).")
             st.stop()
 
+        if up_pdf is None:
+            st.error("The compiled PDF is required — it is the only thing that "
+                     "says where your pages break. Overleaf → Menu → Download "
+                     "→ PDF.")
+            st.stop()
+
         main_tex = find_main_tex(workdir)
         if not main_tex:
             st.error("No .tex file found in the upload.")
@@ -169,23 +185,47 @@ if st.button("Convert to Word →", type="primary"):
 
         srcdir = os.path.dirname(main_tex)
         paper = os.path.splitext(os.path.basename(main_tex))[0]
-        if up_pdf is not None:
-            with open(os.path.join(srcdir, paper + ".pdf"), "wb") as fh:
-                fh.write(up_pdf.getbuffer())
+        with open(os.path.join(srcdir, paper + ".pdf"), "wb") as fh:
+            fh.write(up_pdf.getbuffer())
 
         log_lines = []
-        with st.spinner("Checking the source and converting…"):
-            try:
-                result = convert(main_tex, strict=strict,
-                                 on_log=log_lines.append)
-            except ConversionError as e:
-                st.error(str(e))
-                if e.issues:
-                    show_issues(e.issues, "error")
-                if e.detail:
-                    with st.expander("pandoc output"):
-                        st.code(e.detail)
-                st.stop()
+        bar = st.progress(0.0)
+        status = st.empty()
+
+        def on_progress(frac, msg):
+            bar.progress(frac)
+            status.markdown(f"**{frac * 100:.0f}%** — {msg}")
+
+        try:
+            result = convert(main_tex, strict=strict,
+                             on_log=log_lines.append,
+                             match_pdf=os.path.join(srcdir, paper + ".pdf"),
+                             on_progress=on_progress)
+        except ConversionError as e:
+            bar.empty()
+            status.empty()
+            st.error(str(e))
+            if e.issues:
+                show_issues(e.issues, "error")
+            if e.detail:
+                with st.expander("pandoc output"):
+                    st.code(e.detail)
+            st.stop()
+        bar.empty()
+        status.empty()
+
+        m = getattr(result, "match", None)
+        if m:
+            same = m["pages"] == m["target_pages"]
+            st.markdown(
+                f"**Pages:** {m['pages']} — your PDF has {m['target_pages']}"
+                + ("  ✅" if same else "  ⚠️ not the same") + "  \n"
+                f"**Page starts matching the PDF exactly:** "
+                f"{m['exact_starts']} of {len(m['checks'])}  \n"
+                f"**Layout used:** {m['density']}")
+            if not same:
+                st.warning("The page count does not match. Send the .tex and "
+                           "PDF on so the difference can be tracked down.")
 
         if result.warnings:
             with st.expander(f"⚠ {len(result.warnings)} warning(s) — "
@@ -201,7 +241,7 @@ if st.button("Convert to Word →", type="primary"):
         with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(out, os.path.basename(out))
             included.append(os.path.basename(out))
-            if up_pdf is not None and os.path.exists(pdf_path):
+            if os.path.exists(pdf_path):
                 z.write(pdf_path, paper + ".pdf")
                 included.append(paper + ".pdf")
             for f in sorted(os.listdir(srcdir)):

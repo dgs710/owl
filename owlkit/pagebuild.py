@@ -280,3 +280,101 @@ def assemble(base_path, pages, density, out_path, header_source=None):
 
     doc.save(out_path)
     return placed
+
+
+# ---------------------------------------------------------------------------
+# the whole page-matching run
+# ---------------------------------------------------------------------------
+
+# Loose to tight.  Tightening is monotonic -- a page that fits at one rung
+# still fits at every later one -- so a page only ever has to be re-measured
+# until it first passes.
+DENSITY_LADDER = [
+    (1.00, 140, 1.00),
+    (0.95, 140, 1.00),
+    (0.90, 140, 0.98),
+    (0.85, 140, 0.97),
+    (0.85, 135, 0.96),
+    (0.80, 135, 0.96),
+    (0.75, 130, 0.95),
+    (0.70, 130, 0.95),
+    (0.65, 125, 0.94),
+    (0.60, 120, 0.93),
+    (0.55, 115, 0.92),
+    (0.50, 110, 0.90),
+]
+
+
+def match_pages(docx_path, pdf_path, tex_src, out_path,
+                on_progress=None, safety_in=1.0, ladder=None):
+    """Rebuild the .docx so its pages break where the compiled PDF's do.
+
+    `on_progress(fraction, message)` is called throughout; the search is the
+    slow part, so it reports per rung of the ladder.
+
+    Returns a dict describing what it settled on and how well it matched.
+    """
+    from . import pagefit
+
+    def say(frac, msg):
+        if on_progress:
+            on_progress(max(0.0, min(1.0, frac)), msg)
+
+    ladder = ladder or DENSITY_LADDER
+
+    say(0.02, "reading the compiled PDF")
+    placements = floats.placements(pdf_path)
+    captions = pagefit.caption_index(tex_src)
+    pdf_words, counts = pagefit.page_word_counts(pdf_path, placements, captions)
+    target_pages = len(counts)
+    say(0.08, f"{target_pages} pages in the PDF, {len(placements)} figures and tables")
+
+    workdir = tempfile.mkdtemp(prefix="owlmatch_")
+    chosen = None
+    pending = None                      # pages still to prove; None = all
+
+    for i, (margin, mm, spacing) in enumerate(ladder):
+        d = pagefit.Density(margin_in=margin, image_width_mm=mm,
+                            line_spacing=spacing)
+        frac = 0.10 + 0.65 * (i / max(1, len(ladder)))
+        say(frac, f"fitting pages — margins {margin:.2f} in, figures {mm} mm")
+
+        doc, pages, blocks = page_elements(docx_path, pdf_words, counts,
+                                           placements, d)
+        result = measure(docx_path, pages, d, workdir, only=pending,
+                         safety_in=safety_in)
+        bad = set(overflowing(result))
+        if not bad:
+            chosen = d
+            say(frac + 0.03, f"every page fits with {safety_in:.1f} in to spare")
+            break
+        pending = bad                   # only these still need proving
+
+    if chosen is None:
+        chosen = pagefit.Density(margin_in=ladder[-1][0],
+                                 image_width_mm=ladder[-1][1],
+                                 line_spacing=ladder[-1][2])
+        say(0.75, f"{len(pending)} page(s) remain tight even at the "
+                  f"smallest margins")
+
+    say(0.80, "assembling the document")
+    doc, pages, blocks = page_elements(docx_path, pdf_words, counts,
+                                       placements, chosen)
+    assemble(docx_path, pages, chosen, out_path)
+
+    say(0.88, "checking the result against the PDF")
+    rendered = pagefit.render_pdf(out_path, workdir)
+    got_pages = pagefit.page_count(rendered)
+    checks = pagefit.verify(pdf_path, rendered, placements, captions)
+    exact = sum(1 for c in checks if c.first_ok)
+
+    say(1.0, f"{got_pages} pages, {exact}/{len(checks)} starting on the "
+             f"same word as the PDF")
+    return {
+        "density": chosen,
+        "pages": got_pages,
+        "target_pages": target_pages,
+        "exact_starts": exact,
+        "checks": checks,
+        "unresolved": sorted(pending) if chosen is None else [],
+    }
